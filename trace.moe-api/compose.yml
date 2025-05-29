@@ -1,0 +1,27 @@
+services:
+  mariadb:
+    image: mariadb:latest
+    restart: unless-stopped
+    environment:
+      - MARIADB_ROOT_PASSWORD=${SOLA_DB_PWD}
+    ports:
+      - ${SOLA_DB_PORT}:3306
+    networks:
+      trace_moe_net:
+
+  liresolr:
+    image: ghcr.io/soruly/liresolr:latest
+    command: solr-precreate cl_0 /opt/solr/server/solr/configsets/liresolr
+    restart: unless-stopped
+    ports:
+      - 18983:8983
+    volumes:
+      - type: bind
+        source: /var/solr
+        target: /var/solr
+    networks:
+      trace_moe_net:
+
+networks:
+  trace_moe_net:
+    driver: bridge

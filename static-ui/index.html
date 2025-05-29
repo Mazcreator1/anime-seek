@@ -1,0 +1,184 @@
+import { useEffect, useState } from "react";
+import Head from "next/head";
+import Result from "../components/result";
+import Player from "../components/player";
+import Info from "../components/info";
+import SearchBar from "../components/search-bar";
+import styles from "../components/index.module.css";
+
+const NEXT_PUBLIC_API_ENDPOINT = process.env.NEXT_PUBLIC_API_ENDPOINT;
+const NEXT_PUBLIC_ANILIST_ENDPOINT = process.env.NEXT_PUBLIC_ANILIST_ENDPOINT || "https://graphql.anilist.co";
+
+const AppSearchPage = () => {
+const [dropText, setDropText] = useState("");
+const [cutBorders, setCutBorders] = useState(true);
+const [imageURL, setImageURL] = useState("");
+const [searchImageSrc, setSearchImageSrc] = useState("");
+const [searchImage, setSearchImage] = useState(null);
+const [results, setResults] = useState([]);
+const [message, setMessage] = useState("");
+const [selected, setSelected] = useState(null);
+const [metaInfo, setMetaInfo] = useState(null);
+const [player, setPlayer] = useState({ src: null, timeCode: "", fileName: "" });
+const [loading, setLoading] = useState(false);
+const [searching, setSearching] = useState(false);
+
+useEffect(() => {
+document.addEventListener("paste", (e) => {
+const item = Array.from(e.clipboardData?.items || []).find((i) => i.type.startsWith("image"));
+if (item) {
+setSearchImageSrc(URL.createObjectURL(item.getAsFile()));
+e.preventDefault();
+}
+});
+}, []);
+
+useEffect(() => {
+if (!searchImageSrc) return;
+setLoading(true);
+setMessage("Loading image...");
+const img = new Image();
+img.onload = () => {
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d");
+const scale = Math.min(640 / img.width, 640 / img.height);
+canvas.width = img.width * scale;
+canvas.height = img.height * scale;
+ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+canvas.toBlob((blob) => {
+setLoading(false);
+setSearchImage(blob);
+startSearch(blob);
+}, "image/jpeg", 0.8);
+};
+img.onerror = () => setMessage("Image load failed.");
+img.src = searchImageSrc;
+}, [searchImageSrc]);
+
+const startSearch = async (blob) => {
+setMessage("Searching...");
+setResults([]);
+setSelected(null);
+setMetaInfo(null);
+setPlayer({ src: null, timeCode: "", fileName: "" });
+setSearching(true);
+
+const formData = new FormData();
+formData.append("image", blob);
+
+const res = await fetch(`${NEXT_PUBLIC_API_ENDPOINT}/search?anilistInfo=true${cutBorders ? "&cutBorders" : ""}`, {
+method: "POST",
+body: formData,
+});
+setSearching(false);
+
+if (!res.ok) {
+setMessage("Search failed. Try again later.");
+return;
+}
+
+const { result = [], frameCount = 0 } = await res.json();
+setMessage(`Searched ${frameCount} frames.`);
+
+const metadata = await queryAnilist(result.map(r => r.anilist).filter(Boolean));
+
+const mapped = result.slice(0, 5).map(r => {
+const meta = metadata.find(m => m.id === r.anilist);
+r.anilist = meta || r.anilist;
+r.playResult = () => {
+setSelected(r);
+setPlayer({ src: r.video, fileName: r.filename, timeCode: r.from });
+setMetaInfo(meta || null);
+};
+return r;
+});
+
+setResults(mapped);
+if (mapped[0]) mapped[0].playResult();
+};
+
+const queryAnilist = async (ids) => {
+if (!ids.length) return [];
+const res = await fetch(NEXT_PUBLIC_ANILIST_ENDPOINT, {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify({
+query: `query ($ids: [Int]) {
+Page(page: 1, perPage: 50) {
+media(id_in: $ids, type: ANIME) {
+id title { native romaji english } isAdult coverImage { large } siteUrl
+}
+}
+}`,
+variables: { ids },
+}),
+});
+if (!res.ok) return [];
+const json = await res.json();
+return json.data?.Page?.media || [];
+};
+
+return (
+<div className={searchImageSrc ? styles.mainReady : styles.main}>
+    <Head>
+        <title>Anime Scene Search</title>
+    </Head>
+
+    {!searchImageSrc && (
+    <div
+            className={styles.dropTarget}
+            onDrop={(e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file?.type.startsWith("image")) {
+    setSearchImageSrc(URL.createObjectURL(file));
+    }
+    }}
+    onDragOver={(e) => e.preventDefault()}
+    >{dropText || "Drop image here or paste from clipboard"}</div>
+)}
+
+<SearchBar
+        searchImageSrc={searchImageSrc}
+        imageURL={imageURL}
+        setImageURL={setImageURL}
+        setSearchImageSrc={setSearchImageSrc}
+        cutBorders={cutBorders}
+        setCutBorders={setCutBorders}
+        searching={searching}
+        search={startSearch}
+        searchImage={searchImage}
+/>
+
+{searchImageSrc && (
+<div className={styles.wrap}>
+    <div className={styles.resultList}>
+        <div className={styles.searchImageDisplay}>
+            <div className={styles.detail}>Search Image</div>
+            <img src={searchImageSrc} className={styles.originalImageDisplay} alt="search" />
+            <div className={styles.messageTextLabel}>{message}</div>
+        </div>
+        {results.map((r, i) => (
+        <Result key={i} searchResult={r} active={r === selected} />
+        ))}
+    </div>
+
+    {selected && (
+    <div className={styles.playerInfoPane}>
+        <Player
+                src={player.src}
+                timeCode={player.timeCode}
+                fileName={player.fileName}
+                isLoading={loading}
+                isSearching={searching}
+        />
+        <Info anilist={metaInfo} />
+    </div>
+    )}
+</div>
+)}
+</div>
+);
+};
+
+export default AppSearchPage;

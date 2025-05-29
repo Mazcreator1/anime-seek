@@ -1,0 +1,36 @@
+{
+  "name": "trace.moe-www",
+  "version": "2.0.0",
+  "description": "Webpage for trace.moe",
+  "main": "image-proxy.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "build-start": "next build && next start",
+    "prettier": "prettier",
+    "format": "prettier --write \"**/*.js\"",
+    "lint": "prettier --check \"**/*.js\"",
+    "test": "prettier --check \"**/*.js\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/soruly/trace.moe-www.git"
+  },
+  "author": "soruly",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/soruly/trace.moe-www/issues"
+  },
+  "homepage": "https://github.com/soruly/trace.moe-www#readme",
+  "devDependencies": {
+    "prettier": "^3.5.3"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.9",
+    "next": "^15.3.2",
+    "react": "^19.0.0",
+    "react-chartjs-2": "^5.3.0",
+    "react-dom": "^19.0.0"
+  }
+}
