@@ -1,4 +1,4 @@
-package com.example.anime_finder;
+package com.mazcr.anime_seek;
 
 import io.flutter.embedding.android.FlutterActivity;
 

@@ -1,0 +1,5644 @@
+import 'dart:math' as math;
+import 'package:flutter/material.dart';
+import 'profile_page.dart';
+import 'package:image_picker/image_picker.dart';
+import 'dart:io';
+import 'package:anime_finder/services/auth_service.dart';
+import 'package:http/http.dart' as http;
+import '../widgets/expanded_post_modal.dart';
+import 'package:anime_finder/models/scene_history_model.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:http_parser/http_parser.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+import 'package:video_player/video_player.dart';
+import '../widgets/show_card.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:anime_finder/services/api_client.dart';
+import 'dart:convert';
+import 'dart:ui' show FontFeature;
+import 'dart:async';
+import '../services/feed_bus.dart';
+
+const int? kTopFindUserId = 282; // e.g. 42; keep null if unknown.
+
+bool isWeeklyTopFindPost(dynamic p) {
+  if (p is! Map) return false;
+
+  // Coerce to Map<String, dynamic>
+  Map<String, dynamic> _asStrMap(Map m) =>
+      m.map((k, v) => MapEntry(k.toString(), v));
+  String _s(dynamic v) => v == null ? '' : v.toString();
+
+  final m = _asStrMap(p);
+
+  // 1) Author check (primary signal since "TopFind" is a user)
+  final userRaw = m['user'];
+  final user = (userRaw is Map) ? _asStrMap(userRaw) : const <String, dynamic>{};
+  final uid = user['id'];
+  final uidNum = (uid is num) ? uid.toInt() : int.tryParse(_s(uid) );
+  final name = _s(user['display_name'] ?? user['username'] ?? user['name']).trim();
+
+  if (kTopFindUserId != null && uidNum == kTopFindUserId) return true;
+  if (name.replaceAll(' ', '').toLowerCase() == 'topfind') return true;
+
+  // 2) Keep supporting explicit server flags/types if present
+  final type   = _s(m['type']).toLowerCase();
+  final cat    = _s(m['category']).toLowerCase();
+  final label  = _s(m['label'] ?? m['badge'] ?? m['tag'] ?? m['topic']).toLowerCase();
+
+  bool _hit(String s) {
+    final t = s.toLowerCase();
+    final norm = t.replaceAll(RegExp(r'[^a-z]'), ' ');
+    return RegExp(r'\btop\s*finds?\b').hasMatch(norm) ||
+        RegExp(r'\bweekly\s*top\s*finds?\b').hasMatch(norm) ||
+        t.contains('topfind') || t.contains('top_find');
+  }
+
+  if (type == 'topfind' || _hit(cat) || _hit(label)) return true;
+
+  final tags = m['tags'];
+  if (tags is List && tags.any((e) => _hit(_s(e)))) return true;
+  if (tags is! List && _hit(_s(tags))) return true;
+
+  final flags = [m['is_top_find'], m['top_find'], m['weekly_top_find'], m['isTopFind']];
+  if (flags.any((f) => _s(f).toLowerCase() == 'true' || f == true)) return true;
+
+  return false;
+}
+
+
+String? _friendlyVoteError(http.Response res, {String? endpoint}) {
+  // Decode safely (may be empty on prod 500s)
+  String body;
+  try {
+    body = utf8.decode(res.bodyBytes);
+  } catch (_) {
+    body = res.body;
+  }
+  final low = body.toLowerCase();
+
+  // Known good cases
+  final isDupWords = low.contains('duplicate key value') ||
+      low.contains('unique constraint') ||
+      low.contains('already exists');
+
+  final mentionsPoll = low.contains('poll_vote') ||
+      low.contains('poll_votes') ||
+      low.contains('poll_id');
+
+  // Server ideally returns 409 for duplicates
+  if (res.statusCode == 409 || (res.statusCode == 500 && isDupWords && mentionsPoll)) {
+    return 'Your vote was already counted.';
+  }
+
+  // Rate limit
+  if (res.statusCode == 429) {
+    return 'You’re voting too fast. Try again in a moment.';
+  }
+
+  // Validation/forbidden variants that still carry friendly wording
+  if (res.statusCode == 403 || res.statusCode == 400 || res.statusCode == 422) {
+    if (low.contains('already') && low.contains('vot')) {
+      return 'Your vote was already counted.';
+    }
+    if (low.contains('closed') || low.contains('ended')) {
+      return 'This poll is closed.';
+    }
+  }
+  final ep = (endpoint ?? '').toLowerCase();
+  final looksLikeVoteEndpoint = ep.contains('/poll/vote') || ep.endsWith('vote');
+  if (res.statusCode == 500 && looksLikeVoteEndpoint) {
+    return 'Your vote was already counted.';
+  }
+
+  return null; // use generic “Vote failed (…)”
+}
+
+
+
+class PollOption {
+  final int id;
+  final int idx;
+  final String text;
+  final int voteCount;
+  PollOption({required this.id, required this.idx, required this.text, required this.voteCount});
+}
+
+class PollData {
+  final bool isPoll;
+  final String question;
+  final List<PollOption> options;
+  final List<int> votedOptionIds;
+  final bool multiple;
+  final bool allowChange;
+  final int totalVotes;
+
+  PollData({
+    required this.isPoll,
+    required this.question,
+    required this.options,
+    required this.votedOptionIds,
+    required this.multiple,
+    required this.allowChange,
+    required this.totalVotes,
+  });
+}
+
+PollData parsePoll(Map<String, dynamic> p) {
+  String _s(dynamic v) => v == null ? '' : v.toString();
+
+  // detect "poll" either by type or presence of poll-like keys
+  final type = _s(p['type']).toLowerCase();
+  final pollObj = (p['poll'] is Map) ? (p['poll'] as Map).cast<String, dynamic>() : <String, dynamic>{};
+  final isPoll = type == 'poll' || pollObj.isNotEmpty || p.containsKey('question') || p.containsKey('options');
+
+  // question fallbacks (mirror how we send it)
+  final question = _s(
+    pollObj['question'] ??
+        p['question'] ??
+        p['poll_question'] ??
+        p['text'] ?? // fallback to text/content if server mirrored it there
+        p['content'] ??
+        '',
+  );
+
+  // ----- OPTIONS: normalize from many possible shapes -----
+  bool _looksLikeFilePath(String s) {
+    final lower = s.toLowerCase();
+    if (lower.contains('uploadfile') || lower.contains('filename')) return true;
+    if (lower.contains('content-disposition')) return true;
+    if (s.contains('/') || s.contains('\\')) return true;
+    final exts = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.mp4'];
+    return exts.any((ext) => lower.endsWith(ext));
+  }
+
+  List<PollOption> _fromListOfStrings(List lst) {
+    return lst.asMap().entries.map((e) {
+      final idx = e.key;
+      final txt = _s(e.value).trim();
+      return PollOption(id: idx + 1, idx: idx, text: txt, voteCount: 0);
+    }).where((o) => o.text.isNotEmpty && !_looksLikeFilePath(o.text)).toList();
+  }
+
+  List<PollOption> _fromListOfMaps(List lst) {
+    int auto = 0;
+    return lst.whereType<Map>().map((raw) {
+      final m = raw.cast<String, dynamic>();
+      final idRaw = m['id'] ?? m['option_id'] ?? m['key'];
+      final id = (idRaw is num) ? idRaw.toInt() : int.tryParse('$idRaw') ?? ++auto;
+
+      final idxRaw = m['idx'] ?? m['index'] ?? m['order'];
+      final idx = (idxRaw is num) ? idxRaw.toInt() : int.tryParse('$idxRaw') ?? (auto - 1);
+
+      final text = _s(m['text'] ?? m['label'] ?? m['value'] ?? m['name'] ?? m['title'] ?? m['option'] ?? m['option_text']).trim();
+
+      final vcRaw = m['vote_count'] ?? m['votes'] ?? m['count'];
+      final voteCount = (vcRaw is num) ? vcRaw.toInt() : int.tryParse('$vcRaw') ?? 0;
+
+      return PollOption(id: id, idx: idx, text: text, voteCount: voteCount);
+    }).where((o) => o.text.isNotEmpty && !_looksLikeFilePath(o.text)).toList();
+  }
+
+  List<PollOption> _fromMapObject(Map obj) {
+    var i = 0;
+    final out = <PollOption>[];
+    obj.forEach((k, v) {
+      i++;
+      final id = (k is num) ? k.toInt() : int.tryParse('$k') ?? i;
+      if (v is Map) {
+        final m = v.cast<String, dynamic>();
+        final text = _s(m['text'] ?? m['label'] ?? m['value'] ?? m['name'] ?? m['title'] ?? m['option_text']).trim();
+        final vcRaw = m['vote_count'] ?? m['votes'] ?? m['count'];
+        final voteCount = (vcRaw is num) ? vcRaw.toInt() : int.tryParse('$vcRaw') ?? 0;
+        if (text.isNotEmpty && !_looksLikeFilePath(text)) {
+          out.add(PollOption(id: id, idx: i - 1, text: text, voteCount: voteCount));
+        }
+      } else {
+        final text = _s(v).trim();
+        if (text.isNotEmpty && !_looksLikeFilePath(text)) {
+          out.add(PollOption(id: id, idx: i - 1, text: text, voteCount: 0));
+        }
+      }
+    });
+    return out;
+  }
+
+  List<PollOption> options = const <PollOption>[];
+  dynamic rawOptions =
+      pollObj['options'] ??
+          p['options'] ??
+          pollObj['choices'] ??
+          p['choices'] ??
+          pollObj['answers'] ??
+          p['answers'] ??
+          pollObj['poll_options'] ??
+          p['poll_options'] ??
+          // stringified (from multipart)
+          pollObj['options_json'] ??
+          p['options_json'] ??
+          pollObj['choices_json'] ??
+          p['choices_json'];
+
+  List<PollOption> _tryParseString(dynamic s) {
+    final str = _s(s).trim();
+    if (str.isEmpty) return const <PollOption>[];
+    // JSON?
+    if (str.startsWith('[') || str.startsWith('{')) {
+      try {
+        final decoded = jsonDecode(str);
+        if (decoded is List) {
+          return decoded.isNotEmpty && decoded.first is Map
+              ? _fromListOfMaps(decoded)
+              : _fromListOfStrings(decoded);
+        } else if (decoded is Map) {
+          return _fromMapObject(decoded);
+        }
+      } catch (_) {/* continue */}
+    }
+    // comma / newline separated
+    final parts = str.split(RegExp(r'[\n,]')).map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    return _fromListOfStrings(parts);
+  }
+
+  if (rawOptions is List) {
+    options = rawOptions.isNotEmpty && rawOptions.first is Map
+        ? _fromListOfMaps(rawOptions)
+        : _fromListOfStrings(rawOptions);
+  } else if (rawOptions is Map) {
+    options = _fromMapObject(rawOptions);
+  } else if (rawOptions is String) {
+    options = _tryParseString(rawOptions);
+  }
+
+  // voted & flags
+  final voted = () {
+    final v = pollObj['voted_option_ids'] ?? p['voted_option_ids'] ?? pollObj['voted'] ?? p['voted'];
+    if (v is List) {
+      return v.map((e) => (e is num) ? e.toInt() : int.tryParse('$e') ?? 0).where((x) => x > 0).toList();
+    }
+    return const <int>[];
+  }();
+
+  final multiple = (pollObj['multiple'] == true) || (p['multiple'] == true);
+  final allowChange = pollObj['allow_change'] != false && p['allow_change'] != false;
+
+  final totalVotes = (() {
+    final t = pollObj['total_votes'] ?? p['total_votes'] ?? pollObj['votes'] ?? p['votes'];
+    if (t is num) return t.toInt();
+    if (t is String) {
+      final n = int.tryParse(t);
+      if (n != null) return n;
+    }
+    return options.fold<int>(0, (a, o) => a + o.voteCount);
+  })();
+
+  return PollData(
+    isPoll: isPoll && question.isNotEmpty && options.length >= 2,
+    question: question,
+    options: options,
+    votedOptionIds: voted,
+    multiple: multiple,
+    allowChange: allowChange,
+    totalVotes: totalVotes,
+  );
+}
+
+
+
+
+Map<String, String> _jsonHeaders(Map<String, String> auth) => {
+  ...auth,
+  'Content-Type': 'application/json; charset=utf-8',
+  'Accept': 'application/json',
+};
+
+Map<String, String> _stripContentType(Map<String, String> auth) {
+  final h = Map<String, String>.from(auth);
+  h.removeWhere((k, _) => k.toLowerCase() == 'content-type');
+  h['Accept'] = 'application/json';
+  return h;
+}
+
+class FeedPage extends StatefulWidget {
+  const FeedPage({Key? key}) : super(key: key);
+
+  @override
+  State<FeedPage> createState() => _FeedPageState();
+}
+
+class _FeedPageState extends State<FeedPage> with TickerProviderStateMixin {
+  int selectedTab = 0;
+  final PageController _pageController = PageController();
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+
+    super.dispose();
+  }
+
+  void _openProfile(int userId) {
+    debugPrint('Opening profile for userId=$userId');
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ProfilePage(userId: userId),
+      ),
+    );
+  }
+
+  Widget _segmentedTabs(ColorScheme cs) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(0.4),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.outlineVariant.withOpacity(.6)),
+      ),
+      child: Row(
+        children: [
+          _pillTab("Global Posts", 0, cs),
+          _pillTab("Following Posts", 1, cs),
+          _pillTab("Weekly Top Finds", 2, cs),
+        ],
+      ),
+    );
+  }
+
+  Widget _pillTab(String label, int index, ColorScheme cs) {
+    final bool isSelected = selectedTab == index;
+    return Expanded(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: () {
+          setState(() {
+            selectedTab = index;
+            _pageController.jumpToPage(index);
+          });
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? cs.primary.withOpacity(.12) : Colors.transparent,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Text(
+            label,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontWeight: FontWeight.w700,
+              color: isSelected ? cs.primary : cs.onSurfaceVariant,
+              letterSpacing: .2,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Scaffold(
+      backgroundColor: Theme.of(context).scaffoldBackgroundColor,
+      body: SafeArea(
+        child: Column(
+          children: [
+            _segmentedTabs(cs),
+            const SizedBox(height: 6),
+            Expanded(
+              child: PageView(
+                controller: _pageController,
+                physics: const NeverScrollableScrollPhysics(),
+                children: [
+                  TickerMode(
+                    enabled: selectedTab == 0,
+                    child: GlobalFeedTab(onAvatarTap: _openProfile, isActive: selectedTab == 0),
+                  ),
+                  TickerMode(
+                    enabled: selectedTab == 1,
+                    child: FollowingFeedTab(onAvatarTap: _openProfile, isActive: selectedTab == 1),
+                  ),
+                  TickerMode(
+                    enabled: selectedTab == 2,
+                    child: WeeklyTopFindsTab(onAvatarTap: _openProfile, isActive: selectedTab == 2),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+String _pickStr(Map<String, dynamic> m, List<String> keys) {
+  for (final k in keys) {
+    final v = m[k];
+    if (v == null) continue;
+    final s = v.toString().trim();
+    if (s.isNotEmpty) return s;
+  }
+  return '';
+}
+class GlobalFeedTab extends StatefulWidget {
+  final void Function(int userId) onAvatarTap;
+  final bool isActive;
+  const GlobalFeedTab({required this.onAvatarTap, required this.isActive, super.key});
+
+  @override
+  State<GlobalFeedTab> createState() => _GlobalFeedTabState();
+}
+
+
+class _GlobalFeedTabState extends State<GlobalFeedTab>
+    with AutomaticKeepAliveClientMixin<GlobalFeedTab> {
+  @override
+  bool get wantKeepAlive => true;
+
+  int? currentUserId;
+  bool _loading = false;
+  List<dynamic> posts = [];
+  int? animeTierId;
+  bool? isSubscribed;
+  bool isAdmin = false;
+  DateTime? _lastOwnPostAt;
+  DateTime? _nextAllowedPostAt;
+
+  bool get isPremium => (animeTierId ?? 0) >= 1 || (isSubscribed == true);
+  
+  bool _alive = false;
+  void _ss(VoidCallback fn) {
+    if (_alive && mounted) setState(fn);
+  }
+  
+  bool get canPostNow {
+    if (isPremium) return true;
+    if (_nextAllowedPostAt == null) return true;
+    final now = DateTime.now().toUtc();
+    return !now.isBefore(_nextAllowedPostAt!);
+  }
+
+  late StreamSubscription<Map<String, dynamic>>? _newPostSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _alive = true;
+    _init();
+    _newPostSub = FeedBus.onNewPost.listen(_prependPost);
+  }
+
+  @override
+  void dispose() {
+    _alive = false;
+    _newPostSub?.cancel();
+    super.dispose();
+  }
+
+  void _prependPost(Map<String, dynamic> p) {
+    setState(() {
+      posts.insert(0, p);
+
+      // If this is my post, immediately update cooldown window.
+      final uid = currentUserId;
+      if (uid != null) {
+        final user = (p['user'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+        final rawId = user['id'];
+        final id = (rawId is num) ? rawId.toInt() : int.tryParse('$rawId');
+
+        if (id == uid) {
+          final created = _parseWhen(p); // helper at bottom of file
+          _lastOwnPostAt = created;
+          if (!isPremium) {
+            _nextAllowedPostAt = created.toUtc().add(const Duration(days: 7));
+          }
+        }
+      }
+    });
+  }
+
+  Color? _parseHex(String? hex) {
+    if (hex == null) return null;
+    var v = hex.trim();
+    if (v.isEmpty) return null;
+
+    // allow "RRGGBB" or "AARRGGBB" (no leading '#')
+    if (!v.startsWith('#')) v = '#$v';
+
+    v = v.replaceFirst('#', '');
+
+    if (v.length == 6) return Color(int.parse('FF$v', radix: 16)); // opaque
+    if (v.length == 8) return Color(int.parse(v, radix: 16));      // argb
+    return null;
+  }
+
+  List<SceneHistoryEntry> _buildFromServerProfile(dynamic recent) {
+    if (recent is! List) return const <SceneHistoryEntry>[];
+    return recent.whereType<Map<String, dynamic>>().map((m) {
+      final ts = (m['timestamp'] ?? '').toString();
+      DateTime? parsed;
+      try {
+        if (ts.isNotEmpty) parsed = DateTime.parse(ts);
+      } catch (_) {}
+      return SceneHistoryEntry(
+        aniListId: (m['id'] is num) ? (m['id'] as num).toInt() : 0,
+        title: (m['anime_title'] ?? '').toString(),
+        coverUrl: (m['thumbnail'] ?? '').toString(),
+        episode: '-',
+        timeRange: '',
+        updatedAt: null,
+        dateAdded: parsed ?? DateTime.now(),
+      );
+    }).take(3).toList();
+  }
+
+  Widget _PollBadge() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+    decoration: BoxDecoration(
+      color: Theme.of(context).colorScheme.primary.withOpacity(.12),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: Theme.of(context).colorScheme.primary.withOpacity(.35)),
+    ),
+    child: Row(
+      mainAxisSize: MainAxisSize.min,
+      children: const [
+        Icon(Icons.poll, size: 14),
+        SizedBox(width: 4),
+        Text('Poll', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+      ],
+    ),
+  );
+
+  Widget _CompactPollInline({
+    required String question,
+    required List<String> options,
+    VoidCallback? onTap,
+  }) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(.28),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+      ),
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            question,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurface),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: (options.isEmpty ? const <String>[] : options.take(4)).map((opt) {
+              return OutlinedButton(
+                onPressed: onTap, // tap opens comments sheet for now
+                style: OutlinedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: Text(opt, maxLines: 1, overflow: TextOverflow.ellipsis),
+              );
+            }).toList(),
+          ),
+        ],
+      ),
+    );
+  }
+  Future<void> _loadPostQuota(Map<String, String> baseHeaders) async {
+    try {
+      final res = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/me/post-quota'),
+        headers: {...baseHeaders, 'Accept': 'application/json'},
+      );
+      if (!mounted) return;
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final next = data['next_allowed_post_at'] as String?;
+        final backendIsPremium = data['is_premium'] == true;
+
+        setState(() {
+          if (backendIsPremium) {
+            animeTierId ??= 1;
+            isSubscribed = true;
+          }
+          _nextAllowedPostAt = (next != null && next.isNotEmpty)
+              ? DateTime.parse(next).toUtc()
+              : null;
+        });
+      } else {
+        debugPrint('post-quota failed: ${res.statusCode} ${res.body}');
+      }
+    } catch (e) {
+      debugPrint('post-quota error: $e');
+    }
+  }
+
+
+  void _appendCompactPollIfAny({
+    required Map<String, dynamic> post,
+    required Map<String, dynamic> user,
+    required List<Widget> children,
+  }) {
+    // detect poll shape
+    final isPoll = ((post['type'] ?? '') as String).toLowerCase() == 'poll';
+    final question = (post['question'] ?? post['poll']?['question'] ?? '').toString();
+    final List<String> options = (() {
+      final raw = post['options'] ?? post['poll']?['options'];
+      if (raw is List) return raw.map((e) => '$e').toList();
+      return const <String>[];
+    })();
+
+    if (!isPoll || question.isEmpty) return;
+
+    final cs = Theme.of(context).colorScheme;
+
+    // add a compact “Poll” chip over the card (badge)
+    children.add(
+      Align(
+        alignment: Alignment.topRight,
+        child: Container(
+          margin: const EdgeInsets.only(top: 6, right: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: cs.primary.withOpacity(.12),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: cs.primary.withOpacity(.35)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: const [
+              Icon(Icons.poll, size: 14),
+              SizedBox(width: 4),
+              Text('Poll', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    // compact poll block under the post (doesn't take over screen)
+    children.add(
+      Container(
+        margin: const EdgeInsets.only(top: 6),
+        decoration: BoxDecoration(
+          color: cs.surfaceVariant.withOpacity(.28),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+        ),
+        padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              question,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurface),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: (options.isEmpty ? const <String>[] : options.take(4)).map((opt) {
+                return OutlinedButton(
+                  onPressed: () => _openPostQuick(post, user), // tap any option → open comments
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  child: Text(opt, maxLines: 1, overflow: TextOverflow.ellipsis),
+                );
+              }).toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _init() async {
+    if (mounted) setState(() => _loading = true);
+    try {
+      final headers = await AuthService.authHeaders;
+
+      final userRes = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/auth/me'),
+        headers: headers,
+      );
+      if (userRes.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(userRes.bodyBytes));
+        if (!mounted) return;
+        setState(() {
+          currentUserId = data['id'];
+          animeTierId = (data['anime_tier_id'] is num) ? (data['anime_tier_id'] as num).toInt() : 0;
+          isSubscribed = data['is_subscribed'] == true;
+          isAdmin = data['is_admin'] == true;
+        });
+      } else {
+        debugPrint("Failed to load profile: ${userRes.statusCode}");
+      }
+
+      await _fetchPosts();
+    } catch (e) {
+      debugPrint("Init error: $e");
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<int?> _meIdFromHeaders() async {
+    try {
+      final h = await AuthService.authHeaders;
+      final r = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/auth/me'),
+        headers: {...h, 'Accept': 'application/json'},
+      );
+      if (r.statusCode == 200) {
+        final j = jsonDecode(utf8.decode(r.bodyBytes));
+        final v = j['id'];
+        return (v is num) ? v.toInt() : int.tryParse('$v');
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _likePostQuick(int postId) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      final uri = Uri.parse('https://anime-seek.com/fastapi/posts/$postId/like');
+      final r = await http.post(uri, headers: headers);
+      if (r.statusCode == 200 && mounted) {
+        final j = jsonDecode(utf8.decode(r.bodyBytes));
+        setState(() {
+          posts = posts.map((it) {
+            final m = Map<String, dynamic>.from(it as Map);
+            if ((m['id'] as num).toInt() == postId) {
+              m['liked_by_me'] = j['liked'] == true;
+              m['like_count'] = (j['like_count'] as num?)?.toInt() ?? (m['like_count'] ?? 0);
+            }
+            return m;
+          }).toList();
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _reshareQuick(int postId) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      final uri = Uri.parse('https://anime-seek.com/fastapi/posts/$postId/reshare');
+      final r = await http.post(uri, headers: headers);
+      if (r.statusCode == 200 && mounted) {
+        final j = jsonDecode(utf8.decode(r.bodyBytes));
+        setState(() {
+          posts = posts.map((it) {
+            final m = Map<String, dynamic>.from(it as Map);
+            if ((m['id'] as num).toInt() == postId) {
+              m['reshared_by_me'] = j['reshared'] == true;
+              m['reshare_count'] = (j['reshare_count'] as num?)?.toInt() ?? (m['reshare_count'] ?? 0);
+            }
+            return m;
+          }).toList();
+        });
+      }
+    } catch (_) {}
+  }
+  
+  int _toInt(dynamic v) {
+  if (v is int) return v;
+  if (v is num) return v.toInt();
+  return int.tryParse('$v') ?? 0;
+  }
+  
+  Future<void> _fetchPosts() async {
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/feed/global'),
+        headers: headers,
+      );
+      if (!mounted) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final all = (data is List) ? data.cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+        final filtered = all.where((m) => !isWeeklyTopFindPost(m)).toList();
+
+        // Figure out the last time THIS user posted anything
+        DateTime? lastOwn;
+        final uid = currentUserId;
+        if (uid != null) {
+          for (final m in filtered) {
+            final user = (m['user'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+            final rawId = user['id'];
+            final id = (rawId is num) ? rawId.toInt() : int.tryParse('$rawId');
+            if (id == uid) {
+              final created = _parseWhen(m); // helper at bottom of file
+              if (lastOwn == null || created.isAfter(lastOwn)) {
+                lastOwn = created;
+              }
+            }
+          }
+        }
+
+        // For non-Pro, 7-day cooldown from last post
+        DateTime? nextAllowed;
+        if (!isPremium && lastOwn != null) {
+          nextAllowed = lastOwn.toUtc().add(const Duration(days: 7));
+        }
+
+        if (mounted) {
+          setState(() {
+            posts = filtered;
+            _lastOwnPostAt = lastOwn;
+            _nextAllowedPostAt = nextAllowed;
+          });
+        }
+
+        debugPrint('Global posts loaded (excluding TopFind): ${posts.length}');
+      } else {
+        debugPrint("Failed to fetch posts: ${res.statusCode} ${res.body}");
+      }
+    } catch (e) {
+      debugPrint("Global fetch error: $e");
+    }
+  }
+
+  String _fullAvatarUrl(String url) {
+    final u = url.trim();
+    if (u.isEmpty) {
+      return 'https://anime-seek.com/uploads/user_avatars/default_avatar.jpg';
+    }
+    return u.startsWith('http')
+        ? u
+        : 'https://anime-seek.com${u.startsWith('/') ? '' : '/'}$u';
+  }
+
+  Future<void> _openPostQuick(Map<String, dynamic> p, Map<String, dynamic> u) async {
+    String _fixAniListCdn(String url) {
+      final s = url.trim();
+      if (s.startsWith('https://img.anili.st/media/') && s.endsWith('.jpg')) {
+        return s.substring(0, s.length - 4);
+      }
+      return s;
+    }
+
+    String _briefSummary({
+      required String text,
+      required bool isPoll,
+      required String pollQ,
+      required bool hasImage,
+      required bool hasVideo,
+      int maxChars = 160,
+    }) {
+      String s = text.trim().isNotEmpty
+          ? text.trim()
+          : (isPoll
+          ? (pollQ.trim().isNotEmpty ? '📊 $pollQ' : '📊 Poll')
+          : (hasVideo
+          ? '🎬 Video attached'
+          : (hasImage ? '🖼️ Image attached' : 'Post')));
+      if (s.length > maxChars) s = '${s.substring(0, maxChars).trim()}…';
+      return s;
+    }
+
+    final username = (u['display_name'] ?? 'Unknown').toString();
+    final avatarUrl = (u['avatar_url'] ?? '/uploads/user_avatars/default_avatar.jpg').toString();
+
+    final postUserIdRaw = u['id'];
+    final postUserId = (postUserIdRaw is num)
+        ? postUserIdRaw.toInt()
+        : int.tryParse('$postUserIdRaw') ?? 0;
+
+    // background color hex (server may use either key)
+    final bgHex = (p['background_color'] ?? p['bg_color'] ?? '').toString();
+
+    final text = (p['text'] ?? '').toString();
+    final imagePreview = (p['image_preview_url'] ?? '').toString();
+    final imageUrl = (p['image_url'] ?? '').toString();
+    final videoUrl = (p['video_url'] ?? '').toString();
+
+    final poll = parsePoll(p);
+    final isPoll = poll.isPoll;
+
+    final hasImage = imagePreview.isNotEmpty || imageUrl.isNotEmpty;
+    final hasVideo = videoUrl.isNotEmpty;
+
+    final chosenImage = imagePreview.isNotEmpty ? imagePreview : imageUrl;
+    final chosenImageAbs =
+    chosenImage.isEmpty ? null : _absUrl(_fixAniListCdn(chosenImage));
+    final videoAbs = videoUrl.isEmpty ? null : _absUrl(videoUrl);
+
+    final summaryText = _briefSummary(
+      text: text,
+      isPoll: isPoll,
+      pollQ: poll.question,
+      hasImage: hasImage,
+      hasVideo: hasVideo,
+    );
+
+    final summaryThumb = chosenImageAbs;
+    final fullText = text.trim();
+    final displayContent = fullText.isNotEmpty ? fullText : summaryText;
+
+    final postUser = (p['user'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+
+
+    final changed = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useRootNavigator: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Theme.of(context).colorScheme.scrim.withOpacity(0.45),
+      builder: (ctx) => SafeArea(
+        top: false,
+        child: Container(
+          decoration: BoxDecoration(
+            color: _parseHex(bgHex) ?? Theme.of(ctx).colorScheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: FractionallySizedBox(
+            heightFactor: 0.94,
+            child: CommentsSheet(
+              postId: (p['id'] as num).toInt(),
+              postUserId: postUserId,
+              backgroundColorHex: bgHex,
+              username: username,
+              avatarUrl: _fullAvatarUrl(avatarUrl),
+              content: displayContent,
+              imageUrl: chosenImageAbs,
+              videoUrl: videoAbs,
+              onAvatarTap: widget.onAvatarTap,
+              poll: isPoll ? poll : null,
+              summaryText: summaryText,
+              summaryThumbUrl: summaryThumb,
+            ),
+          ),
+        ),
+      ),
+    );
+
+    if (changed == true && mounted) {
+      await _fetchPosts();
+    }
+  }
+  
+  String _normalizeHex(String hex) {
+  final h = hex.trim();
+  if (h.isEmpty) return '';
+  if (h.startsWith('#')) return h;
+  // accept "RRGGBB"
+  if (h.length == 6) return '#$h';
+  // accept "AARRGGBB" -> "#RRGGBB" is fine too, but your parsers accept 8-char
+  return '#$h';
+}
+  Future<bool> _deleteAny(int postId, {required bool isMyReshare}) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      final uri = isMyReshare
+          ? Uri.parse('https://anime-seek.com/fastapi/posts/$postId/reshare')
+          : Uri.parse('https://anime-seek.com/fastapi/posts/$postId');
+
+      final res = await http.delete(uri, headers: headers);
+      if (res.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(isMyReshare ? 'Reshare removed' : 'Post deleted')),
+          );
+        }
+        return true;
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: ${res.statusCode}')),
+        );
+      }
+      return false;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+      return false;
+    }
+  }
+
+  Widget _swipeBg(BuildContext ctx) => Container(
+    alignment: Alignment.centerRight,
+    padding: const EdgeInsets.symmetric(horizontal: 16),
+    color: Colors.red,
+    child: const Icon(Icons.delete, color: Colors.white),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    final cs = Theme.of(context).colorScheme;
+
+    if (currentUserId == null) {
+      return RefreshIndicator(
+        onRefresh: _fetchPosts,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: const [
+            SizedBox(height: 160),
+            Center(child: CircularProgressIndicator()),
+          ],
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _fetchPosts,
+      displacement: 24,
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: [
+          const SizedBox(height: 8),
+          PostBox(
+            isPremium: isPremium,
+            canPost: canPostNow,
+            cooldownUntil: _nextAllowedPostAt,
+            onPosted: _fetchPosts,
+          ),
+          const SizedBox(height: 12),
+          if (posts.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 24),
+              child: Center(
+                child: Text(
+                  "No posts found",
+                  style: TextStyle(color: cs.onSurfaceVariant),
+                ),
+              ),
+            )
+          else
+            ...posts.map<Widget>((raw) {
+              final p = (raw as Map).cast<String, dynamic>();
+              final u = (p['user'] as Map?)?.cast<String, dynamic>() ?? const {};
+
+              int _asInt(dynamic v) => (v is num) ? v.toInt() : int.tryParse('$v') ?? 0;
+              String _asStr(dynamic v) => v == null ? '' : v.toString();
+
+              final postId = _asInt(p['id']);
+              final userId = _asInt(u['id']);
+              final username = _asStr(u['display_name']).isEmpty
+                  ? 'Unknown'
+                  : _asStr(u['display_name']);
+              final avatarUrl = _asStr(u['avatar_url']);
+
+              final text = _pickStr(p, ['text', 'content', 'body', 'message']);
+              final imagePreview =
+              _pickStr(p, ['image_preview_url', 'imagePreviewUrl', 'thumbnail_url', 'thumbnail']);
+              final imageUrl = _pickStr(p, ['image_url', 'imageUrl', 'image']);
+              final primaryImage = imagePreview.isNotEmpty ? imagePreview : imageUrl;
+              final videoUrl = _pickStr(p, ['video_url', 'gif_mp4_url', 'video']);
+              final hasImage = primaryImage.isNotEmpty;
+
+              final likeCount = (p['like_count'] as num?)?.toInt() ?? 0;
+              final commentCount = (p['comment_count'] as num?)?.toInt() ?? 0;
+              final likedByMe = p['liked_by_me'] == true;
+              final reshareCount = (p['reshare_count'] as num?)?.toInt() ?? 0;
+              final resharedByMe = p['reshared_by_me'] == true;
+              final canDelete = (currentUserId == userId) || isAdmin || resharedByMe;
+              final bgHex = (p['background_color'] ?? p['bg_color'] ?? '').toString();
+              _asStr(p['background_color'] ?? p['bg_color'] ?? p['bgColor']);
+
+              final pollData = parsePoll(p);
+              final isPoll = pollData.isPoll;
+              final pollQ = pollData.question;
+
+              final displaySnippet = text.isNotEmpty
+                  ? text
+                  : (isPoll
+                  ? (pollQ.isNotEmpty ? '📊 $pollQ' : '📊 Poll')
+                  : (hasImage ? '(image)' : '…'));
+
+              Widget _buildBaseCard() {
+                return ShowCard.post(
+                  userId: userId,
+                  displayName: username,
+                  avatarUrl: _fullAvatarUrl(avatarUrl),
+                  postSnippet: displaySnippet,
+                  backgroundColor: bgHex.isEmpty ? null : _normalizeHex(bgHex),
+                  onOpenProfile: () => widget.onAvatarTap(userId),
+                  onOpenPost: () => _openPostQuick(p, u),
+                  likeCount: likeCount,
+                  commentCount: commentCount,
+                  reshareCount: reshareCount,
+                  likedByMe: likedByMe,
+                  resharedByMe: resharedByMe,
+                  onLike: () => _likePostQuick(postId),
+                  onComment: () => _openPostQuick(p, u),
+                  onReshare: () => _reshareQuick(postId),
+                );
+              }
+
+              Widget regularCard = Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _buildBaseCard(),
+              );
+
+              Widget pollCard = Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  clipBehavior: Clip.hardEdge,
+                  child: Stack(
+                    children: [
+                      ShowCard.post(
+                        userId: userId,
+                        displayName: username,
+                        avatarUrl: _fullAvatarUrl(avatarUrl),
+                        postSnippet: displaySnippet,
+                        backgroundColor: bgHex.isEmpty ? null : _normalizeHex(bgHex),
+                        onOpenProfile: () => widget.onAvatarTap(userId),
+                        onOpenPost: () => _openPostQuick(p, u),
+                        likeCount: likeCount,
+                        commentCount: commentCount,
+                        reshareCount: reshareCount,
+                        likedByMe: likedByMe,
+                        resharedByMe: resharedByMe,
+                        onLike: () => _likePostQuick(postId),
+                        onComment: () => _openPostQuick(p, u),
+                        onReshare: () => _reshareQuick(postId),
+                        outerMargin: EdgeInsets.zero,
+                        clipForOverlay: true,
+                      ),
+                      Align(
+                        alignment: Alignment.topRight,
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 8, right: 8),
+                          child: _PollBadge(),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+
+              final card = isPoll ? pollCard : regularCard;
+
+              if (!canDelete) return card;
+
+              final dismissible = Dismissible(
+                key: ValueKey('post_$postId'),
+                direction: DismissDirection.endToStart,
+                background: _swipeBg(context),
+                dismissThresholds: const {DismissDirection.endToStart: 0.25},
+                confirmDismiss: (_) async {
+                  final idx = posts.indexWhere(
+                          (it) => (it is Map && (it['id'] as num?)?.toInt() == postId));
+                  if (idx == -1) return false;
+                  final removed = posts[idx];
+                  _ss(() => posts.removeAt(idx));
+
+                  final ok = await _deleteAny(postId, isMyReshare: resharedByMe);
+                  if (!ok) _ss(() => posts.insert(idx, removed));
+                  return ok;
+                },
+                child: card,
+              );
+
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onLongPress: () async {
+                  final confirm = await showDialog<bool>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Delete'),
+                      content: Text(resharedByMe
+                          ? 'Remove your reshare of this post?'
+                          : 'Delete this post?'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(ctx, false),
+                          child: const Text('Cancel'),
+                        ),
+                        FilledButton(
+                          onPressed: () => Navigator.pop(ctx, true),
+                          child: const Text('Delete'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (confirm == true) {
+                    final idx = posts.indexWhere(
+                            (it) => (it is Map && (it['id'] as num?)?.toInt() == postId));
+                    if (idx == -1) return;
+                    final removed = posts[idx];
+                    _ss(() => posts.removeAt(idx));
+                    final ok = await _deleteAny(postId, isMyReshare: resharedByMe);
+                    if (!ok) _ss(() => posts.insert(idx, removed));
+                  }
+                },
+                child: dismissible,
+              );
+            }),
+        ],
+      ),
+    );
+  }
+}
+
+
+
+class FollowingFeedTab extends StatefulWidget {
+  final void Function(int userId) onAvatarTap;
+  final bool isActive;
+  const FollowingFeedTab({required this.onAvatarTap, required this.isActive, super.key});
+
+  @override
+  State<FollowingFeedTab> createState() => _FollowingFeedTabState();
+}
+
+class _FollowingFeedTabState extends State<FollowingFeedTab> {
+  List<dynamic> posts = [];
+  int? currentUserId;
+  bool _loading = false;
+  bool _alive = false;
+  bool isAdmin = false;
+  
+  void _ss(VoidCallback fn) { if (_alive && mounted) setState(fn); }
+
+
+  @override
+  void initState() {
+    super.initState();
+    _alive = true;
+    _init();
+  }
+  Future<bool> _deleteAny(int postId, {required bool isMyReshare}) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      final uri = isMyReshare
+          ? Uri.parse('https://anime-seek.com/fastapi/posts/$postId/reshare')
+          : Uri.parse('https://anime-seek.com/fastapi/posts/$postId');
+
+      final res = await http.delete(uri, headers: headers);
+      if (res.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(isMyReshare ? 'Reshare removed' : 'Post deleted')),
+          );
+        }
+        return true;
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: ${res.statusCode}')),
+        );
+      }
+      return false;
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
+      return false;
+    }
+  }
+
+
+  Widget _swipeBg(BuildContext ctx) => Container(
+    alignment: Alignment.centerRight,
+    padding: const EdgeInsets.symmetric(horizontal: 16),
+    color: Colors.red,
+    child: const Icon(Icons.delete, color: Colors.white),
+  );
+
+  Future<void> _init() async {
+    setState(() => _loading = true);
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/auth/me'),
+        headers: headers,
+      );
+
+      if (!mounted) return;
+
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        setState(() {
+          currentUserId = data['id'];
+          _loading = false;
+          isAdmin = data['is_admin'] == true;
+        });
+        await _fetchFollowingPosts();
+      } else {
+        setState(() => _loading = false);
+        debugPrint('Failed to load profile: ${res.statusCode}');
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loading = false);
+      }
+      debugPrint('Profile load error: $e');
+    }
+  }
+
+
+
+
+  Future<void> _fetchFollowingPosts() async {
+    if (_loading) return;
+    _loading = true;
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/feed-follow'),
+        headers: headers,
+      );
+      if (!mounted) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        setState(() => posts = (data is List) ? data : <dynamic>[]);
+        debugPrint('Following posts loaded: ${posts.length}');
+      } else {
+        debugPrint("Following fetch failed: ${res.statusCode} ${res.body}");
+      }
+    } catch (e) {
+      if (mounted) debugPrint("Following fetch error: $e");
+    } finally {
+      _loading = false;
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant FollowingFeedTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive) {
+      if (posts.isEmpty) _fetchFollowingPosts();
+    }
+  }
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    if (currentUserId == null) {
+      return RefreshIndicator(
+        onRefresh: _fetchFollowingPosts,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          children: const [
+            SizedBox(height: 160),
+            Center(child: CircularProgressIndicator()),
+          ],
+        ),
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _fetchFollowingPosts,
+      displacement: 24,
+      child: posts.isEmpty
+          ? ListView(
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: [
+          const SizedBox(height: 24),
+          Center(
+            child: Text(
+              "No posts yet from followed users.",
+              style: TextStyle(color: cs.onSurfaceVariant),
+            ),
+          ),
+        ],
+      )
+          : ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(
+          parent: BouncingScrollPhysics(),
+        ),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        itemCount: posts.length,
+        itemBuilder: (context, index) {
+          final raw = posts[index];
+          final p = (raw as Map).cast<String, dynamic>();
+          final u = (p['user'] as Map?)?.cast<String, dynamic>() ?? const {};
+
+          int _asInt(dynamic v) => (v is num) ? v.toInt() : int.tryParse('$v') ?? 0;
+          String _asStr(dynamic v) => v == null ? '' : v.toString();
+
+          final postId    = _asInt(p['id']);
+          final userId    = _asInt(u['id']);
+          final username  = _asStr(u['display_name']).isEmpty ? 'Unknown' : _asStr(u['display_name']);
+          final avatarUrl = _asStr(u['avatar_url']);
+
+          final content      = _pickStr(p, ['text','content','body','message']);
+          final imagePreview = _pickStr(p, ['image_preview_url','imagePreviewUrl','thumbnail_url','thumbnail']);
+          final imageUrl     = _pickStr(p, ['image_url','imageUrl','image']);
+          final videoUrl     = _pickStr(p, ['video_url','gif_mp4_url','video']);
+
+          final likeCount    = (p['like_count'] as num?)?.toInt() ?? 0;
+          final commentCount = (p['comment_count'] as num?)?.toInt() ?? 0;
+          final likedByMe    = p['liked_by_me'] == true;
+          final bgHex        = _asStr(p['background_color'] ?? p['bg_color'] ?? p['bgColor']);
+          final reshareCount = (p['reshare_count'] as num?)?.toInt() ?? 0;
+          final resharedByMe = p['reshared_by_me'] == true;
+          final canDelete    = (currentUserId == userId) || resharedByMe || isAdmin;
+
+          // Poll
+          final poll = parsePoll(p);
+
+          final hasImage = imagePreview.isNotEmpty || imageUrl.isNotEmpty;
+          final displaySnippet = content.isNotEmpty
+              ? content
+              : (poll.isPoll
+              ? (poll.question.isNotEmpty ? '📊 ${poll.question}' : '📊 Poll')
+              : (hasImage ? '(image)' : '…'));
+
+          final tile = FeedPost(
+            key: ValueKey<int>(postId),
+            postId: postId,
+            userId: userId,
+            currentUserId: currentUserId!,
+            currentUserIsAdmin: isAdmin,
+            onOpenProfile: () => widget.onAvatarTap(userId),
+            username: username,
+            avatarUrl: avatarUrl,
+            content: displaySnippet,
+            imageUrl: imageUrl.isEmpty ? null : imageUrl,
+            imagePreviewUrl: imagePreview.isEmpty ? null : imagePreview,
+            videoUrl: videoUrl.isEmpty ? null : videoUrl,
+            onAvatarTap: widget.onAvatarTap,
+            heroPrefix: 'follow',
+            likeCount: likeCount,
+            commentCount: commentCount,
+            likedByMe: likedByMe,
+            backgroundColor: bgHex.isEmpty ? null : bgHex,
+            reshareCount: reshareCount,
+            resharedByMe: resharedByMe,
+            isPoll: poll.isPoll,
+            poll: poll,
+          );
+
+          if (!canDelete) return tile;
+
+          return Dismissible(
+            key: ValueKey('post_$postId'),
+            direction: DismissDirection.endToStart,
+            background: _swipeBg(context),
+            dismissThresholds: const { DismissDirection.endToStart: 0.25 },
+            confirmDismiss: (_) async {
+              final removed = posts[index];
+              _ss(() => posts.removeAt(index));
+              final ok = await _deleteAny(postId, isMyReshare: resharedByMe);
+              if (!ok) _ss(() => posts.insert(index, removed));
+              return ok;
+            },
+            child: tile,
+          );
+        },
+      ),
+    );
+  }
+}
+class PostBox extends StatefulWidget {
+  final VoidCallback onPosted;
+  final bool isPremium;
+  final bool canPost;
+  final DateTime? cooldownUntil;
+
+  const PostBox({
+    Key? key,
+    required this.onPosted,
+    required this.isPremium,
+    required this.canPost,
+    this.cooldownUntil,
+  }) : super(key: key);
+
+  @override
+  State<PostBox> createState() => _PostBoxState();
+}
+
+class _PostBoxState extends State<PostBox> {
+  final TextEditingController _controller = TextEditingController();
+  File? _mediaFile;
+  String? _mediaMime; // e.g., image/gif or image/jpeg
+  bool isPosting = false;
+  String? _bgHex;
+  bool get _isGif => (_mediaMime ?? '').toLowerCase() == 'image/gif';
+
+  bool _pollMode = false;
+  final TextEditingController _pollQ = TextEditingController();
+  final List<TextEditingController> _pollOpts = [
+    TextEditingController(),
+    TextEditingController(),
+  ];
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _pollQ.dispose();
+    for (final c in _pollOpts) c.dispose();
+    super.dispose();
+  }
+
+  void _togglePollMode() {
+    setState(() {
+      _pollMode = !_pollMode;
+      if (_pollMode) {
+        _controller.clear();
+      } else {
+        _pollQ.clear();
+        for (final c in _pollOpts) c.clear();
+        while (_pollOpts.length > 2) {
+          _pollOpts.removeLast().dispose();
+        }
+      }
+    });
+  }
+
+  void _addPollOption() {
+    setState(() => _pollOpts.add(TextEditingController()));
+  }
+
+  void _removePollOption(int i) {
+    if (_pollOpts.length <= 2) return;
+    final c = _pollOpts.removeAt(i);
+    c.dispose();
+    setState(() {});
+  }
+
+  String _cooldownMessage() {
+    if (widget.cooldownUntil == null) {
+      return 'You’ve reached the weekly post limit for the free tier.';
+    }
+    final now = DateTime.now().toUtc();
+    final diff = widget.cooldownUntil!.difference(now);
+    if (diff.isNegative) return 'You can post again now.';
+
+    final days = diff.inDays;
+    final hours = diff.inHours % 24;
+
+    if (days > 0 && hours > 0) {
+      return 'You can post again in $days day${days == 1 ? '' : 's'} and $hours hour${hours == 1 ? '' : 's'}.';
+    } else if (days > 0) {
+      return 'You can post again in $days day${days == 1 ? '' : 's'}.';
+    } else if (hours > 0) {
+      return 'You can post again in $hours hour${hours == 1 ? '' : 's'}.';
+    }
+    return 'You can post again in less than an hour.';
+  }
+
+  Future<void> _pickImage() async {
+    final picker = ImagePicker();
+    final img = await picker.pickImage(source: ImageSource.gallery, imageQuality: 70);
+    if (img != null) {
+      setState(() {
+        _mediaFile = File(img.path);
+        _mediaMime = 'image/jpeg';
+      });
+    }
+  }
+
+  Future<void> _pickGif() async {
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['gif', 'webp'],
+      withData: true,
+    );
+    if (res == null) return;
+
+    final f = res.files.single;
+    final ext = (f.extension ?? '').toLowerCase();
+    final mime = ext == 'webp' ? 'image/webp' : 'image/gif';
+
+    if (f.path != null) {
+      setState(() {
+        _mediaFile = File(f.path!);
+        _mediaMime = mime;
+      });
+    } else if (f.bytes != null) {
+      final dir = await getTemporaryDirectory();
+      final tmp = File('${dir.path}/pick_${DateTime.now().millisecondsSinceEpoch}.$ext');
+      await tmp.writeAsBytes(f.bytes!, flush: true);
+      setState(() {
+        _mediaFile = tmp;
+        _mediaMime = mime;
+      });
+    }
+  }
+
+  String _encodeForm(Map<String, dynamic> data) {
+    final pairs = <String>[];
+    void add(String k, String v) {
+      pairs.add('${Uri.encodeQueryComponent(k)}=${Uri.encodeQueryComponent(v)}');
+    }
+
+    data.forEach((k, v) {
+      if (v is List) {
+        for (final e in v) add(k, '$e');
+      } else if (v != null) {
+        add(k, '$v');
+      }
+    });
+
+    return pairs.join('&');
+  }
+
+  Future<void> _uploadPost() async {
+    if (!widget.canPost) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Free users can post once per week. Upgrade to Pro or wait until your cooldown ends.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
+    if (_pollMode) {
+      final q = _pollQ.text.trim();
+      final opts = _pollOpts
+          .map((c) => c.text.trim())
+          .where((s) => s.isNotEmpty)
+          .toList();
+
+      if (q.isEmpty || opts.length < 2) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Enter a question and at least two options')),
+          );
+        }
+        return;
+      }
+    } else {
+      final text = _controller.text.trim();
+      if (text.isEmpty && _mediaFile == null) return;
+    }
+
+    setState(() => isPosting = true);
+
+    try {
+      final auth = await AuthService.authHeaders;
+      final uri = Uri.parse('https://anime-seek.com/fastapi/posts');
+
+      // ---------------------------
+      // POLL BRANCH
+      // ---------------------------
+      if (_pollMode) {
+        final question = _pollQ.text.trim();
+        final options = _pollOpts
+            .map((c) => c.text.trim())
+            .where((s) => s.isNotEmpty)
+            .toList();
+
+        // No media → send JSON
+        if (_mediaFile == null) {
+          final payload = {
+            'type': 'poll',
+            'question': question,
+            'options': options,
+            'text': question,
+            if (widget.isPremium && (_bgHex?.isNotEmpty ?? false)) 'bg_color': _bgHex,
+          };
+
+          final res = await http.post(
+            uri,
+            headers: _jsonHeaders(auth),
+            body: jsonEncode(payload),
+          );
+
+          if (res.statusCode == 200 || res.statusCode == 201) {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Poll posted!')),
+              );
+            }
+            _controller.clear();
+            _pollQ.clear();
+            for (final c in _pollOpts) c.clear();
+            setState(() => _pollMode = false);
+            widget.onPosted();
+          } else {
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Failed to post poll (${res.statusCode})')),
+              );
+            }
+          }
+          return;
+        }
+
+        // WITH media → Multipart
+        final headers = _stripContentType(auth);
+        final req = http.MultipartRequest('POST', uri)..headers.addAll(headers);
+
+        req.fields['type'] = 'poll';
+        req.fields['question'] = question;
+        req.fields['text'] = question;
+
+        final optionsJson = jsonEncode(options);
+        req.fields['options_json'] = optionsJson;
+        req.fields['options'] = optionsJson;
+
+        req.files.add(
+          await http.MultipartFile.fromPath(
+            'image',
+            _mediaFile!.path,
+            contentType: _mediaMime != null ? MediaType.parse(_mediaMime!) : null,
+          ),
+        );
+
+        if (widget.isPremium && (_bgHex?.isNotEmpty ?? false)) {
+          req.fields['bg_color'] = _bgHex!;
+        }
+
+        final sent = await req.send();
+        if (sent.statusCode == 200 || sent.statusCode == 201) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Poll + media posted!')),
+            );
+          }
+          _controller.clear();
+          _pollQ.clear();
+          for (final c in _pollOpts) c.clear();
+          setState(() {
+            _pollMode = false;
+            _mediaFile = null;
+            _mediaMime = null;
+          });
+          widget.onPosted();
+        } else {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Failed to post poll (${sent.statusCode})')),
+            );
+          }
+        }
+        return;
+      }
+
+      // ---------------------------
+      // NON-POLL (plain post/media)
+      // ---------------------------
+      final headers = _stripContentType(auth);
+      final req = http.MultipartRequest('POST', uri)..headers.addAll(headers);
+
+      final text = _controller.text.trim();
+      if (text.isNotEmpty) req.fields['text'] = text;
+
+      if (_mediaFile != null) {
+        req.files.add(
+          await http.MultipartFile.fromPath(
+            'image',
+            _mediaFile!.path,
+            contentType: _mediaMime != null ? MediaType.parse(_mediaMime!) : null,
+          ),
+        );
+      }
+      if (widget.isPremium && (_bgHex?.isNotEmpty ?? false)) {
+        req.fields['bg_color'] = _bgHex!;
+      }
+
+      final sent = await req.send();
+      if (sent.statusCode == 200 || sent.statusCode == 201) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Posted!')),
+          );
+        }
+        _controller.clear();
+        setState(() {
+          _mediaFile = null;
+          _mediaMime = null;
+        });
+        widget.onPosted();
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to post (${sent.statusCode})')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => isPosting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.outlineVariant),
+      ),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        children: [
+          if (!widget.canPost) ...[
+            Container(
+              width: double.infinity,
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: cs.errorContainer.withOpacity(.35),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: cs.error.withOpacity(.6)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.lock_clock, size: 18, color: cs.error),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      _cooldownMessage(),
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: cs.onErrorContainer,
+                        height: 1.25,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          if (!_pollMode)
+            TextField(
+              controller: _controller,
+              maxLines: null,
+              decoration: InputDecoration(
+                hintText: "Share something…",
+                isDense: true,
+                filled: true,
+                fillColor: cs.surfaceVariant.withOpacity(.35),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          const SizedBox(height: 8),
+          if (_mediaFile != null)
+            Stack(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: Image.file(
+                    _mediaFile!,
+                    height: 160,
+                    width: double.infinity,
+                    fit: BoxFit.cover,
+                  ),
+                ),
+                Positioned(
+                  top: 6,
+                  right: 6,
+                  child: IconButton.filledTonal(
+                    icon: const Icon(Icons.close),
+                    onPressed: () => setState(() {
+                      _mediaFile = null;
+                      _mediaMime = null;
+                    }),
+                    style: IconButton.styleFrom(visualDensity: VisualDensity.compact),
+                  ),
+                ),
+              ],
+            ),
+          if (widget.isPremium) ...[
+            const SizedBox(height: 8),
+            _ColorPickerRow(
+              selectedHex: _bgHex,
+              onPick: (hex) => setState(() => _bgHex = hex),
+            ),
+          ],
+          if (_pollMode) ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: _pollQ,
+              decoration: InputDecoration(
+                hintText: "Poll question…",
+                isDense: true,
+                filled: true,
+                fillColor: cs.surfaceVariant.withOpacity(.35),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Column(
+              children: [
+                for (int i = 0; i < _pollOpts.length; i++) ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _pollOpts[i],
+                          decoration: InputDecoration(
+                            hintText: "Option ${i + 1}",
+                            isDense: true,
+                            filled: true,
+                            fillColor: cs.surfaceVariant.withOpacity(.35),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: BorderSide.none,
+                            ),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton(
+                        onPressed: _pollOpts.length > 2 ? () => _removePollOption(i) : null,
+                        icon: const Icon(Icons.remove_circle_outline),
+                        tooltip: 'Remove option',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                ],
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: _addPollOption,
+                    icon: const Icon(Icons.add),
+                    label: const Text('Add option'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+          ],
+          Row(
+            children: [
+              IconButton.filledTonal(
+                onPressed: _pickImage,
+                icon: const Icon(Icons.image_rounded),
+                tooltip: 'Add image (JPG/PNG)',
+              ),
+              IconButton.filledTonal(
+                onPressed: _pickGif,
+                icon: const Icon(Icons.gif_box_outlined),
+                tooltip: 'Add GIF',
+              ),
+              const SizedBox(width: 4),
+              FilterChip(
+                label: const Text('Create poll'),
+                selected: _pollMode,
+                onSelected: (_) => _togglePollMode(),
+              ),
+              const Spacer(),
+              FilledButton(
+                onPressed: isPosting ? null : _uploadPost,
+                child: isPosting
+                    ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+                    : Text(_pollMode ? "Post poll" : "Post"),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ColorPickerRow extends StatelessWidget {
+  final List<String> presets = const [
+    '#17181A', // default dark
+    '#222831',
+    '#1B5E20',
+    '#0D47A1',
+    '#311B92',
+    '#4A148C',
+    '#880E4F',
+    '#B71C1C',
+    '#E65100',
+    '#795548',
+  ];
+  final String? selectedHex;
+  final ValueChanged<String> onPick;
+  const _ColorPickerRow({required this.selectedHex, required this.onPick});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 36,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: presets.length + 1,
+        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        itemBuilder: (ctx, i) {
+          if (i == 0) {
+            // clear selection
+            final sel = selectedHex == null;
+            return InkWell(
+              onTap: () => onPick.call(''),
+              borderRadius: BorderRadius.circular(18),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(
+                    color: sel ? Theme.of(ctx).colorScheme.primary : Theme.of(ctx).colorScheme.outlineVariant,
+                    width: sel ? 2 : 1,
+                  ),
+                ),
+                alignment: Alignment.center,
+                child: const Text('Default'),
+              ),
+            );
+          }
+          final hex = presets[i - 1];
+          final color = _parse(hex);
+          final sel = selectedHex?.toUpperCase() == hex.toUpperCase();
+          return InkWell(
+            onTap: () => onPick(hex),
+            child: Container(
+              width: 36, height: 36,
+              decoration: BoxDecoration(
+                color: color,
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: sel ? Theme.of(ctx).colorScheme.primary : Colors.white30,
+                  width: sel ? 3 : 1.2,
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Color _parse(String hex) {
+    final v = hex.replaceFirst('#', '');
+    final n = (v.length == 6) ? 'FF$v' : v;
+    return Color(int.parse(n, radix: 16));
+  }
+}
+
+
+const _emojiFallback = ['Noto Color Emoji', 'Apple Color Emoji', 'Segoe UI Emoji'];
+
+class FeedPost extends StatefulWidget {
+  final int userId;
+  final String username;
+  final int postId;
+  final int? currentUserId;
+  final String avatarUrl;
+  final String content;
+  final String? imageUrl;
+  final void Function(int userId) onAvatarTap;
+  final VoidCallback? onDelete;
+  final String? videoUrl;
+  final String heroPrefix;
+  final String? imagePreviewUrl;
+  final int likeCount;
+  final int commentCount;
+  final bool likedByMe;
+  final String? backgroundColor;
+  final int reshareCount;
+  final bool resharedByMe;
+  final VoidCallback onOpenProfile;
+  // NEW: poll fields (compact)
+  final bool isPoll;
+  final PollData? poll;
+  final bool currentUserIsAdmin;
+
+  const FeedPost({
+    super.key,
+    required this.userId,
+    required this.onOpenProfile,
+    required this.username,
+    required this.avatarUrl,
+    required this.content,
+    required this.postId,
+    required this.likeCount,
+    required this.commentCount,
+    required this.likedByMe,
+    required this.currentUserId,
+    required this.onAvatarTap,
+    this.videoUrl,
+    this.imagePreviewUrl,
+    this.heroPrefix = 'feed',
+    this.onDelete,
+    this.imageUrl,
+    this.backgroundColor,
+    this.reshareCount = 0,
+    this.resharedByMe = false,
+    this.isPoll = false,
+    this.poll,
+    this.currentUserIsAdmin = false,
+
+    
+  });
+
+  @override
+  State<FeedPost> createState() => _FeedPostState();
+}
+
+class _FeedPostState extends State<FeedPost> {
+  List<dynamic> previewComments = [];
+  final TextEditingController _inlineCommentCtrl = TextEditingController();
+  bool _postingInlineComment = false;
+  late int _likeCount = widget.likeCount;
+  late int _commentCount = widget.commentCount;
+  late bool _liked = widget.likedByMe;
+  late int _reshareCount = widget.reshareCount;
+  late bool _reshared = widget.resharedByMe;
+  bool isReply(Map<String, dynamic> item) =>
+      item.containsKey('comment_id') && !item.containsKey('post_id');
+  static String _likeLabel(_FeedPostState s) => 'Like (${s._likeCount})';
+  static String _commentLabel(_FeedPostState s) => 'Comment (${s._commentCount})';
+  static String _shareLabel(_FeedPostState s) => 'Share (${s._reshareCount})';
+  bool _alive = false;
+  void _ss(VoidCallback fn) { if (_alive && mounted) setState(fn); }
+
+  bool get isOwner => widget.userId == widget.currentUserId;
+  bool get canDelete => isOwner || widget.currentUserIsAdmin; 
+  bool get canEdit => isOwner;
+       
+  
+
+  String _fullAvatarUrl(String url) {
+    if (url.isEmpty) return 'https://anime-seek.com/uploads/user_avatars/default_avatar.jpg';
+    if (url.startsWith('/uploads')) return 'https://anime-seek.com$url';
+    return url;
+  }
+
+
+  Color? _parseHex(String? hex) {
+    if (hex == null || hex.isEmpty) return null;
+    final v = hex.replaceFirst('#', '');
+    if (v.length == 6) return Color(int.parse('FF$v', radix: 16)); // force opaque
+    if (v.length == 8) return Color(int.parse(v, radix: 16));
+    return null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _alive = true;
+    _likeCount = widget.likeCount;
+    _commentCount = widget.commentCount;
+    _liked = widget.likedByMe;
+    _loadPreviewComments();
+  }
+
+  @override
+  void dispose() {
+    _alive = false;
+    _inlineCommentCtrl.dispose();
+    super.dispose();
+  }
+
+  void _toggleReshare(BuildContext context) async {
+    final headers = await AuthService.authHeaders;
+    final uri = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/reshare');
+    try {
+      final res = await http.post(uri, headers: headers);
+      if (res.statusCode == 200) {
+        final j = jsonDecode(res.body);
+        setState(() {
+          _reshared = j['reshared'] == true;
+          _reshareCount = (j['reshare_count'] as num?)?.toInt() ?? _reshareCount;
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Reshare failed (${res.statusCode})')));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+    }
+  }
+  Future<void> _vote(int optionId) async {
+    final poll = widget.poll;
+    if (poll == null) return;
+
+    if (poll.votedOptionIds.isNotEmpty && !poll.allowChange) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Your vote was already counted.')),
+      );
+      return;
+    }
+
+    final uri = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/poll/vote');
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.post(
+        uri,
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json; charset=utf-8',
+          'Accept': 'application/json',
+        },
+        body: jsonEncode({'option_ids': [optionId]}),
+      );
+
+      if (!mounted) return;
+
+      if (res.statusCode == 200) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Vote recorded')),
+        );
+        return;
+      }
+
+      // Friendly mapping (passes endpoint so we can treat bare 500s as duplicates)
+      String? friendly = _friendlyVoteError(res, endpoint: uri.path);
+      friendly ??= (res.statusCode == 500 ? 'Your vote was already counted.' : null);
+
+      if ((friendly ?? '').contains('already counted')) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Your vote was already counted.')),
+        );
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(friendly ?? 'Vote failed (${res.statusCode})')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    }
+  }
+
+
+  Future<void> _openDiscordThread() async {
+    const url = 'https://discord.com/channels/1427504640181796879/1427508324181475368';
+    final uri = Uri.parse(url);
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Couldn’t open Discord link')),
+        );
+      }
+    }
+  }
+
+  Future<void> _submitInlineComment() async {
+    final content = _inlineCommentCtrl.text.trim();
+    if (content.isEmpty) return;
+
+    if (mounted) setState(() => _postingInlineComment = true);
+
+    try {
+      final auth = await AuthService.authHeaders;
+      final uri  = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/comments');
+
+      final res = await http.post(
+        uri,
+        headers: _jsonHeaders(auth),
+        body: jsonEncode({'content': content}),
+      );
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final created = jsonDecode(utf8.decode(res.bodyBytes)) as Map<String, dynamic>;
+        _inlineCommentCtrl.clear();
+
+        if (!mounted) return;
+        setState(() {
+          _commentCount += 1;
+          previewComments = [
+            {
+              'id': created['id'],
+              'post_id': widget.postId,
+              'content': created['content'],
+              'created_at': created['created_at'],
+              'user': created['user'] ?? {
+                'id': widget.currentUserId,
+                'display_name': 'You',
+                'avatar_url': '/uploads/default_avatar.jpg',
+              },
+            },
+            ...previewComments,
+          ];
+        });
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Comment posted')),
+          );
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed to post comment (${res.statusCode})')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
+    } finally {
+      if (mounted) setState(() => _postingInlineComment = false);
+    }
+  }
+
+  Future<void> _loadPreviewComments() async {
+    final headers = await AuthService.authHeaders;
+    final uri = Uri.parse(
+        'https://anime-seek.com/fastapi/posts/${widget.postId}/comments'
+            '?preview=true&_=${DateTime.now().millisecondsSinceEpoch}'
+    );
+
+    final res = await http.get(uri, headers: {
+      ...headers,
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Accept': 'application/json',
+    });
+
+    if (res.statusCode == 200) {
+      final body = utf8.decode(res.bodyBytes);
+      final data = json.decode(body) as Map<String, dynamic>;
+      final items = (data['items'] as List).cast<Map<String, dynamic>>();
+      final total = (data['total_count'] as num?)?.toInt() ?? items.length;
+      _ss(() {
+        previewComments = items;
+        _commentCount = total;
+      });
+    } else {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load comments (${res.statusCode})')),
+        );
+      }
+    }
+  }
+
+  void _likePost(BuildContext context) async {
+    final headers = await AuthService.authHeaders;
+    final uri = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/like');
+    try {
+      final res = await http.post(uri, headers: headers);
+      if (res.statusCode == 200) {
+        final j = jsonDecode(res.body);
+        setState(() {
+          _liked = j['liked'] == true;
+          _likeCount = (j['like_count'] as num?)?.toInt() ?? _likeCount;
+        });
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Failed to like")));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+    }
+  }
+
+  void _commentOnPost(BuildContext context) async {
+    final result = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      useRootNavigator: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Theme.of(context).colorScheme.scrim.withOpacity(0.45),
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        return SafeArea(
+          top: false,
+          child: Container(
+            decoration: BoxDecoration(
+              color: cs.surface,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: FractionallySizedBox(
+              heightFactor: 0.94,
+              child: CommentsSheet(
+                postId: widget.postId,
+                postUserId: widget.userId,
+                backgroundColorHex: widget.backgroundColor,
+                username: widget.username,
+                avatarUrl: _fullAvatarUrl(widget.avatarUrl),
+                content: widget.content,
+                imageUrl: widget.imageUrl ?? widget.imagePreviewUrl,
+                videoUrl: widget.videoUrl,
+                onAvatarTap: widget.onAvatarTap,
+                poll: widget.poll,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (result == true) {
+      if (!_alive) return;
+      await _loadPreviewComments();
+    }
+  }
+
+  void _followUser(BuildContext context) async {
+    final headers = await AuthService.authHeaders;
+    final uri = Uri.parse('https://anime-seek.com/fastapi/users/${widget.userId}/follow');
+
+    final res = await http.post(uri, headers: headers);
+    if (mounted) {
+      final msg = res.statusCode == 200 ? "Followed!" : "Already following";
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    }
+  }
+
+  void _editPost(BuildContext context) async {
+    final TextEditingController _editController =
+    TextEditingController(text: widget.content);
+
+    final String? newText = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Edit Post"),
+        content: TextField(
+          controller: _editController,
+          maxLines: null,
+          decoration: const InputDecoration(hintText: "Update your post"),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, null), child: const Text("Cancel")),
+          FilledButton(onPressed: () => Navigator.pop(context, _editController.text.trim()), child: const Text("Save")),
+        ],
+      ),
+    );
+
+    if (newText == null || newText.isEmpty || newText == widget.content) {
+      return;
+    }
+
+    try {
+      final auth = await AuthService.authHeaders;
+      final headers = _stripContentType(auth);
+
+      final uri = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}');
+      final request = http.MultipartRequest('PUT', uri)
+        ..headers.addAll(headers)
+        ..fields['text'] = newText;
+
+      final res = await request.send();
+
+      if (res.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Post updated")));
+          Navigator.pushReplacement(
+            context,
+            PageRouteBuilder(
+              pageBuilder: (_, __, ___) => const FeedPage(),
+              transitionDuration: Duration.zero,
+              reverseTransitionDuration: Duration.zero,
+            ),
+          );
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Update failed: ${res.statusCode}")),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+      }
+    }
+  }
+
+  void _deletePost(BuildContext context) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Delete"),
+        content: Text(widget.resharedByMe
+            ? "Remove your reshare of this post?"
+            : "Delete this post?"),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text("Cancel")),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text("Delete")),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final headers = await AuthService.authHeaders;
+      final uri = widget.resharedByMe
+          ? Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/reshare')
+          : Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}');
+
+      final res = await http.delete(uri, headers: headers);
+      if (res.statusCode == 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(widget.resharedByMe ? 'Reshare removed' : 'Post deleted')),
+          );
+        }
+        widget.onDelete?.call();
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Delete failed: ${res.statusCode}')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      }
+    }
+  }
+
+  // ---- COMPACT POLL BLOCK ----
+  Widget _CompactPollBlock({ required PollData poll }) {
+    final cs = Theme.of(context).colorScheme;
+    final voted = poll.votedOptionIds.toSet();
+
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(.28),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+      ),
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            poll.question,
+            maxLines: 10,
+            overflow: TextOverflow.visible,
+            style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurface),
+          ),
+          const SizedBox(height: 8),
+          PollFacebookList(
+            poll: poll,
+            voted: voted,
+            busy: false,
+            compact: false,        // <— show ALL options on the card
+            onVote: _vote,
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final bg = _parseHex(widget.backgroundColor) ?? Theme.of(context).colorScheme.surface;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.outlineVariant),
+      ),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              InkWell(
+                onTap: () => widget.onAvatarTap(widget.userId),
+                borderRadius: BorderRadius.circular(999),
+                child: CircleAvatar(
+                  backgroundImage: NetworkImage(_fullAvatarUrl(widget.avatarUrl)),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        widget.username,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (widget.isPoll) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: cs.primary.withOpacity(.12),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: cs.primary.withOpacity(.35)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: const [
+                            Icon(Icons.poll, size: 14),
+                            SizedBox(width: 4),
+                            Text('Poll', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (isOwner) ...[
+                IconButton(
+                  icon: const Icon(Icons.edit, size: 18),
+                  tooltip: 'Edit',
+                  onPressed: () => _editPost(context),
+                  visualDensity: VisualDensity.compact,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.delete, size: 18),
+                  tooltip: 'Delete',
+                  onPressed: () => _deletePost(context),
+                  visualDensity: VisualDensity.compact,
+                ),
+              ],
+            ],
+          ),
+
+          const SizedBox(height: 8),
+          Text(
+            widget.content,
+            style: const TextStyle(
+              height: 1.32,
+              fontFamilyFallback: _emojiFallback,
+            ),
+          ),
+
+          // COMPACT POLL (if present)
+          if (widget.isPoll && widget.poll != null && widget.poll!.question.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            _CompactPollBlock(poll: widget.poll!),
+          ],
+
+          if ((widget.imagePreviewUrl ?? widget.imageUrl)?.isNotEmpty == true) ...[
+            const SizedBox(height: 10),
+            GestureDetector(
+              onTap: () {
+                final poster = _absUrl(widget.imageUrl ?? widget.imagePreviewUrl!);
+                final vid = (widget.videoUrl?.isNotEmpty ?? false) ? _absUrl(widget.videoUrl!) : null;
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => FullscreenImageViewer(
+                      tag: '${widget.heroPrefix}-post-image-${widget.postId}',
+                      imageUrl: poster,
+                      videoUrl: vid,
+                    ),
+                  ),
+                );
+              },
+              child: Hero(
+                tag: '${widget.heroPrefix}-post-image-${widget.postId}',
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: (widget.videoUrl != null && widget.videoUrl!.isNotEmpty)
+                      ? _InlineAutoVideo(
+                    posterUrl: _absUrl(widget.imagePreviewUrl ?? widget.imageUrl!),
+                    videoUrl: _absUrl(widget.videoUrl!),
+                  )
+                      : _PostPreviewImage(
+                    url: _absUrl(widget.imagePreviewUrl ?? widget.imageUrl!),
+                  ),
+                ),
+              ),
+            ),
+          ],
+
+          if (previewComments.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            _HairlineDivider(),
+            ...previewComments.take(3).map(
+                  (c) => _CommentRow(
+                comment: c,
+                onProfileTap: widget.onAvatarTap,
+              ),
+            ),
+            if (_commentCount > 3) ...[
+              const SizedBox(height: 4),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton(
+                  onPressed: () => _commentOnPost(context),
+                  child: Text('View all $_commentCount comments'),
+                ),
+              ),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: _openDiscordThread,
+                  icon: const Icon(Icons.launch, size: 18),
+                  label: const Text('Continue discussion on Discord → #app-post'),
+                ),
+              ),
+            ],
+          ],
+
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 120),
+                  child: TextField(
+                    controller: _inlineCommentCtrl,
+                    decoration: InputDecoration(
+                      hintText: 'Write a comment…',
+                      isDense: true,
+                      filled: true,
+                      fillColor: cs.surfaceVariant.withOpacity(.35),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: BorderSide.none,
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    ),
+                    minLines: 1,
+                    maxLines: 4,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              _postingInlineComment
+                  ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+                  : IconButton.filledTonal(
+                icon: const Icon(Icons.send),
+                onPressed: _submitInlineComment,
+                tooltip: 'Send',
+                style: IconButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          _HairlineDivider(),
+          Row(
+            children: const [
+              Expanded(child: _ActionBtn(icon: Icons.thumb_up_alt_outlined, labelBuilder: _likeLabel)),
+              Expanded(child: _ActionBtn(icon: Icons.mode_comment_outlined, labelBuilder: _commentLabel)),
+            ],
+          )
+        ],
+      ),
+    );
+  }
+}
+
+
+class _PostPreviewImage extends StatelessWidget {
+  const _PostPreviewImage({required this.url});
+  final String url;
+
+  @override
+  Widget build(BuildContext context) {
+    const double minH = 160, maxH = 360;
+
+    final bg = Theme.of(context).colorScheme.surface;
+
+    return LayoutBuilder(
+      builder: (ctx, constraints) {
+        final dpr = MediaQuery.of(ctx).devicePixelRatio;
+        final cacheW = (constraints.maxWidth.isFinite ? constraints.maxWidth * dpr : MediaQuery.of(ctx).size.width * dpr)
+            .clamp(320, 2048)
+            .round();
+
+        return RepaintBoundary(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(
+              minHeight: minH,
+              maxHeight: maxH,
+              minWidth: 0,
+              maxWidth: double.infinity,
+            ),
+            child: Image.network(
+              url,
+              key: ValueKey('preview::$url'),
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.low,
+              cacheWidth: cacheW,
+              gaplessPlayback: false,
+              loadingBuilder: (c, child, prog) {
+                if (prog == null) return child;
+                return Container(
+                  height: minH,
+                  width: double.infinity,
+                  color: bg,
+                  alignment: Alignment.center,
+                  child: const CircularProgressIndicator(strokeWidth: 2),
+                );
+              },
+              errorBuilder: (c, err, st) => Container(
+                height: minH,
+                width: double.infinity,
+                color: bg,
+                alignment: Alignment.center,
+                child: const Icon(Icons.broken_image_outlined),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+String _absUrl(String raw) {
+  final u = (raw).trim();
+  if (u.isEmpty) return u;
+  return u.startsWith('http') ? u : 'https://anime-seek.com${u.startsWith('/') ? '' : '/'}$u';
+}
+
+bool _isAnimatedUrl(String url) {
+  final u = url.toLowerCase();
+  return u.contains('.gif') || u.contains('.webp');
+}
+
+String _posterOf(String raw) {
+  return raw.replaceFirst(RegExp(r'\.(gif|webp)(\?.*)?$', caseSensitive: false), '.jpg');
+}
+
+class _SmartAnimatedImage extends StatelessWidget {
+  const _SmartAnimatedImage({required this.animatedUrl, required this.posterUrl});
+
+  final String animatedUrl;
+  final String posterUrl;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        _PostPreviewImage(url: posterUrl),
+        Positioned(
+          right: 8,
+          bottom: 8,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.55),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: const Text(
+              'GIF',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: .6,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _CommentRow extends StatelessWidget {
+  final Map<String, dynamic> comment;
+  final void Function(int userId) onProfileTap;
+
+  const _CommentRow({
+    Key? key,
+    required this.comment,
+    required this.onProfileTap,
+  }) : super(key: key);
+
+  String _fullUrl(String? url) {
+    final u = (url ?? '').trim();
+    if (u.isEmpty) {
+      return 'https://anime-seek.com/uploads/user_avatars/default_avatar.jpg';
+    }
+    return u.startsWith('http') ? u : 'https://anime-seek.com${u.startsWith('/') ? '' : '/'}$u';
+  }
+
+  int _toIntId(dynamic v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return int.tryParse('$v') ?? 0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final u = (comment['user'] as Map?)?.cast<String, dynamic>() ?? <String, dynamic>{};
+    final uid = _toIntId(u['id']);
+    final name = (u['display_name'] ?? 'User').toString();
+    final avatar = _fullUrl(
+      (u['avatar_url'] ?? '/uploads/default_avatar.jpg').toString(),
+    );
+    final text = (comment['content'] ?? '').toString();
+
+    void _open() {
+      if (uid > 0) onProfileTap(uid);
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          GestureDetector(onTap: _open, child: CircleAvatar(radius: 12, backgroundImage: NetworkImage(avatar))),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                GestureDetector(
+                  onTap: _open,
+                  child: Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontWeight: FontWeight.w600, color: cs.onSurface),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(text, style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+class _PollInSheet extends StatelessWidget {
+  final PollData poll;
+  final Future<void> Function(int optionId) onVote;
+  final bool busy;
+
+  const _PollInSheet({
+    Key? key,
+    required this.poll,
+    required this.onVote,
+    required this.busy,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final voted = poll.votedOptionIds.toSet();
+
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(.28),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+      ),
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(poll.question,
+              style: TextStyle(fontWeight: FontWeight.w700, color: cs.onSurface)),
+          const SizedBox(height: 10),
+
+          // 🔄 FB-style list here:
+          PollFacebookList(
+            poll: poll,
+            voted: voted,
+            busy: busy,
+            compact: false,
+            onVote: onVote,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _HairlineDivider extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Divider(
+      height: 16,
+      thickness: .6,
+      color: cs.outlineVariant.withOpacity(.6),
+    );
+  }
+}
+class PollProgressList extends StatelessWidget {
+  final PollData poll;
+  final Set<int> voted;
+  final bool busy;
+  final bool compact; // if true, show only first 4 options and tighter spacing
+  final Future<void> Function(int optionId) onVote;
+
+  const PollProgressList({
+    Key? key,
+    required this.poll,
+    required this.voted,
+    required this.busy,
+    required this.onVote,
+    this.compact = false,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    // Calculate total from either server or sum of options (fallback)
+    final sum = poll.options.fold<int>(0, (a, o) => a + o.voteCount);
+    final total = (poll.totalVotes > 0 ? poll.totalVotes : sum);
+    final shown = compact ? poll.options.take(4).toList() : poll.options;
+
+    Widget _buildOption(PollOption o) {
+      final selected = voted.contains(o.id);
+      final pct = total == 0 ? 0.0 : (o.voteCount / total);
+      final pctText = total == 0 ? '0%' : '${(pct * 100).toStringAsFixed(0)}%';
+
+      final disabled =
+          busy || (!poll.allowChange && voted.isNotEmpty && !selected);
+
+      return InkWell(
+        onTap: disabled ? null : () => onVote(o.id),
+        borderRadius: BorderRadius.circular(10),
+        child: Padding(
+          padding: EdgeInsets.symmetric(vertical: compact ? 6 : 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Label + percentage + (optional) check
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      o.text,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                        color: cs.onSurface,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  if (total > 0)
+                    Text(
+                      pctText,
+                      style: TextStyle(
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                        color: cs.onSurfaceVariant,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  if (selected) ...[
+                    const SizedBox(width: 6),
+                    Icon(Icons.check_circle, size: 16, color: cs.primary),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 6),
+              // Animated bar
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: TweenAnimationBuilder<double>(
+                  tween: Tween(begin: 0, end: pct),
+                  duration: const Duration(milliseconds: 350),
+                  curve: Curves.easeOutCubic,
+                  builder: (context, value, _) {
+                    return SizedBox(
+                      height: compact ? 10 : 12,
+                      child: LinearProgressIndicator(
+                        value: value,
+                        backgroundColor: cs.surfaceVariant.withOpacity(.55),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ...shown.map(_buildOption),
+        const SizedBox(height: 6),
+        Text(
+          '${total} vote${total == 1 ? '' : 's'}'
+              '${poll.multiple ? ' • multiple allowed' : ''}'
+              '${!poll.allowChange ? ' • final' : ''}',
+          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+class PollFacebookList extends StatelessWidget {
+  final PollData poll;
+  final Set<int> voted;
+  final bool busy;
+  final bool compact; // tighter paddings, cap to 4 options (for feed cards)
+  final Future<void> Function(int optionId) onVote;
+
+  const PollFacebookList({
+    Key? key,
+    required this.poll,
+    required this.voted,
+    required this.busy,
+    required this.onVote,
+    this.compact = false,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final shown = compact ? poll.options.take(4).toList() : poll.options;
+
+    // Totals (fallback to sum)
+    final sum = poll.options.fold<int>(0, (a, o) => a + o.voteCount);
+    final total = poll.totalVotes > 0 ? poll.totalVotes : sum;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (int i = 0; i < shown.length; i++)
+          _OptionRow(
+            index: i,                         // <- use display order
+            option: shown[i],
+            total: total,
+            voted: voted,
+            busy: busy,
+            compact: compact,
+            showResults: (poll.totalVotes > 0) || voted.isNotEmpty,
+            allowChange: poll.allowChange,
+            onVote: onVote,
+          ),
+        const SizedBox(height: 6),
+        Text(
+          '${(total > 0 ? total : 0)} vote${(total == 1) ? '' : 's'}'
+              '${poll.multiple ? ' • multiple allowed' : ''}'
+              '${!poll.allowChange ? ' • final' : ''}',
+          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+
+class _OptionRow extends StatelessWidget {
+  const _OptionRow({
+    required this.index,
+    required this.option,
+    required this.total,
+    required this.voted,
+    required this.busy,
+    required this.compact,
+    required this.showResults,
+    required this.allowChange,
+    required this.onVote,
+  });
+
+  final int index;
+  final PollOption option;
+  final int total;
+  final Set<int> voted;
+  final bool busy;
+  final bool compact;
+  final bool showResults;
+  final bool allowChange;
+  final Future<void> Function(int optionId) onVote;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final base = _optionColor(context, index);     // <- stable vivid color
+    final selected = voted.contains(option.id);
+    final canTap = !busy && (allowChange || voted.isEmpty || selected);
+
+    final pct = (total == 0) ? 0.0 : (option.voteCount / total);
+    final visualPct = showResults ? (total == 0 ? 0.0 : pct.clamp(0.06, 1.0)) : 0.0;
+
+    final track = cs.surfaceVariant.withOpacity(.55);
+    final fill  = base.withOpacity(selected ? 0.34 : 0.22);
+    final barH  = compact ? 34.0 : 40.0;
+
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: canTap ? () => onVote(option.id) : null,
+      child: Padding(
+        padding: EdgeInsets.symmetric(vertical: compact ? 6 : 8),
+        child: LayoutBuilder(
+          builder: (ctx, c) => Stack(
+            children: [
+              // Track container with a thin left color stripe (always visible)
+              Container(
+                height: barH,
+                decoration: BoxDecoration(
+                  color: track,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+                ),
+                padding: const EdgeInsets.only(left: 0),
+              ),
+
+              // Left color stripe (always on, so every option "has color")
+              Positioned.fill(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Container(
+                    width: 6,
+                    height: barH,
+                    decoration: BoxDecoration(
+                      color: base,
+                      borderRadius: const BorderRadius.horizontal(left: Radius.circular(10)),
+                    ),
+                  ),
+                ),
+              ),
+
+              // Filled percentage (only when results are shown)
+              if (visualPct > 0)
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: TweenAnimationBuilder<double>(
+                      tween: Tween(begin: 0, end: visualPct.toDouble()),
+                      duration: const Duration(milliseconds: 380),
+                      curve: Curves.easeOutCubic,
+                      builder: (context, value, _) => Container(
+                        height: barH,
+                        width: c.maxWidth * value,
+                        color: fill,
+                      ),
+                    ),
+                  ),
+                ),
+
+              // Content
+              Container(
+                height: barH,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(
+                  children: [
+                    // Color dot (always visible)
+                    Container(
+                      width: 10,
+                      height: 10,
+                      margin: const EdgeInsets.only(right: 10),
+                      decoration: BoxDecoration(
+                        color: base,
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Theme.of(context).brightness == Brightness.dark
+                              ? Colors.white12
+                              : Colors.black12,
+                        ),
+                      ),
+                    ),
+
+                    // Radio when there are no results yet
+                    if (!showResults) ...[
+                      Icon(
+                        selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+                        size: 18,
+                        color: selected ? base : cs.onSurfaceVariant.withOpacity(0.9),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+
+                    // Label
+                    Expanded(
+                      child: Text(
+                        option.text,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                          color: cs.onSurface,
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(width: 10),
+
+                    // Percentage
+                    if (showResults)
+                      Text(
+                        total == 0 ? '0%' : '${(pct * 100).toStringAsFixed(0)}%',
+                        style: TextStyle(
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                          fontWeight: FontWeight.w700,
+                          color: selected ? cs.onSurface : base,
+                        ),
+                      ),
+
+                    if (selected && showResults) ...[
+                      const SizedBox(width: 6),
+                      Icon(Icons.check_circle, size: 18, color: base),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+// Strong, consistent palette by display order — independent of theme.
+Color _optionColor(BuildContext context, int i) {
+  const palette = <Color>[
+    Color(0xFF2962FF), // blue
+    Color(0xFFAA00FF), // purple
+    Color(0xFF00C853), // green
+    Color(0xFFFF6D00), // orange
+    Color(0xFFFF4081), // pink
+    Color(0xFF00B8D4), // teal/cyan
+    Color(0xFFFFC400), // amber
+    Color(0xFF304FFE), // indigo
+    Color(0xFF1DE9B6), // mint
+    Color(0xFFFF5252), // red
+  ];
+  return palette[i % palette.length];
+}
+
+
+class FullscreenImageViewer extends StatefulWidget {
+  final String tag;
+  final String imageUrl;
+  final String? videoUrl;
+
+  const FullscreenImageViewer({
+    Key? key,
+    required this.tag,
+    required this.imageUrl,
+    this.videoUrl,
+  }) : super(key: key);
+
+  @override
+  State<FullscreenImageViewer> createState() => _FullscreenImageViewerState();
+}
+
+class _FullscreenImageViewerState extends State<FullscreenImageViewer> {
+  VideoPlayerController? _vc;
+  Future<void>? _init;
+
+  bool get _hasVideo => (widget.videoUrl != null && widget.videoUrl!.isNotEmpty);
+
+  @override
+  void initState() {
+    super.initState();
+    if (_hasVideo) {
+      final uri = Uri.parse(widget.videoUrl!);
+      _vc = VideoPlayerController.networkUrl(uri);
+      _vc!.setLooping(true);
+      _init = _vc!.initialize().then((_) {
+        if (mounted) setState(() {});
+        _vc!.play();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _vc?..pause();
+    _vc?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: () => Navigator.of(context).pop(),
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: SafeArea(
+          child: Stack(
+            children: [
+              Center(
+                child: Hero(
+                  tag: widget.tag,
+                  child: _hasVideo
+                      ? _VideoSurface(
+                    controller: _vc!,
+                    init: _init!,
+                    posterUrl: widget.imageUrl,
+                  )
+                      : InteractiveViewer(
+                    minScale: 0.7,
+                    maxScale: 4.0,
+                    child: Image.network(widget.imageUrl),
+                  ),
+                ),
+              ),
+              Positioned(
+                top: 8,
+                left: 8,
+                child: IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoSurface extends StatelessWidget {
+  final VideoPlayerController controller;
+  final Future<void> init;
+  final String posterUrl;
+
+  const _VideoSurface({
+    Key? key,
+    required this.controller,
+    required this.init,
+    required this.posterUrl,
+  }) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<void>(
+      future: init,
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done || !controller.value.isInitialized) {
+          return Image.network(posterUrl, fit: BoxFit.contain);
+        }
+        final ar = controller.value.aspectRatio == 0 ? 16 / 9 : controller.value.aspectRatio;
+        return AspectRatio(
+          aspectRatio: ar,
+          child: VideoPlayer(controller),
+        );
+      },
+    );
+  }
+}
+
+bool _isAbsolute(String u) => u.startsWith('http');
+String _abs(String u) => _isAbsolute(u) ? u : 'https://anime-seek.com$u';
+
+class _InlineAutoVideo extends StatefulWidget {
+  final String posterUrl; // jpg poster
+  final String videoUrl; // mp4 loop
+  const _InlineAutoVideo({required this.posterUrl, required this.videoUrl});
+
+  @override
+  State<_InlineAutoVideo> createState() => _InlineAutoVideoState();
+}
+
+class _InlineAutoVideoState extends State<_InlineAutoVideo> {
+  VideoPlayerController? _vc;
+  Future<void>? _init;
+
+  bool _isVisible = false; // >= threshold
+  static const _visThreshold = 0.6;
+  bool _disposed = false;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    // stop safely before dispose
+    try {
+      final c = _vc;
+      if (c != null && c.value.isInitialized) {
+        c.pause();
+      }
+    } catch (_) {}
+    _vc?.dispose();
+    _vc = null;
+    _init = null;
+    super.dispose();
+  }
+
+  void _ensureController() {
+    if (_disposed || _vc != null) return;
+    final uri = Uri.parse(widget.videoUrl);
+    final c = VideoPlayerController.networkUrl(uri)
+      ..setLooping(true)
+      ..setVolume(0.0);
+    _vc = c;
+    _init = c.initialize().then((_) {
+      if (_disposed || !mounted) return;
+      setState(() {}); // show initialized surface
+      if (_isVisible && !_disposed && c.value.isInitialized) {
+        c.play();
+      }
+    }).catchError((_) {});
+  }
+
+  void _maybePlayPause() {
+    if (_disposed) return;
+    final c = _vc;
+    if (c == null || !c.value.isInitialized) return;
+
+    // guard notifyListeners after dispose
+    try {
+      if (_isVisible) {
+        if (!c.value.isPlaying) c.play();
+      } else {
+        if (c.value.isPlaying) c.pause();
+      }
+    } catch (_) {
+      // swallow callbacks that race after dispose
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const double minH = 160, maxH = 360;
+    final bg = Theme.of(context).colorScheme.surface;
+
+    return VisibilityDetector(
+      key: ValueKey('vid::${widget.videoUrl}'),
+      onVisibilityChanged: (info) {
+        if (_disposed) return;
+        final nowVisible = info.visibleFraction >= _visThreshold;
+        if (nowVisible != _isVisible) {
+          _isVisible = nowVisible;
+          if (_isVisible) _ensureController();
+          // schedule to avoid re-entrancy if dispose happens mid-callback
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!_disposed && mounted) _maybePlayPause();
+          });
+        }
+      },
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          minHeight: minH,
+          maxHeight: maxH,
+          minWidth: 0,
+          maxWidth: double.infinity,
+        ),
+        child: _buildSurface(bg, minH),
+      ),
+    );
+  }
+
+  Widget _buildSurface(Color bg, double minH) {
+    final c = _vc;
+    final init = _init;
+
+    // not initialized yet → show poster
+    if (c == null || init == null) {
+      return Image.network(
+        widget.posterUrl,
+        fit: BoxFit.cover,
+        loadingBuilder: (ctx, child, prog) {
+          if (prog == null) return child;
+          return Container(
+            height: minH,
+            width: double.infinity,
+            color: bg,
+            alignment: Alignment.center,
+            child: const CircularProgressIndicator(strokeWidth: 2),
+          );
+        },
+        errorBuilder: (ctx, e, st) => Container(
+          height: minH,
+          width: double.infinity,
+          color: bg,
+          alignment: Alignment.center,
+          child: const Icon(Icons.broken_image_outlined),
+        ),
+      );
+    }
+
+    return FutureBuilder<void>(
+      future: init,
+      builder: (context, snap) {
+        if (_disposed || snap.connectionState != ConnectionState.done || !c.value.isInitialized) {
+          return Image.network(widget.posterUrl, fit: BoxFit.cover);
+        }
+        final ar = c.value.aspectRatio == 0 ? 16 / 9 : c.value.aspectRatio;
+        return AspectRatio(
+          aspectRatio: ar,
+          child: VideoPlayer(c),
+        );
+      },
+    );
+  }
+}
+
+
+class AutoPlayVideo extends StatefulWidget {
+  final String videoUrl;
+  final String posterUrl; // jpg poster
+  const AutoPlayVideo({super.key, required this.videoUrl, required this.posterUrl});
+
+  @override
+  State<AutoPlayVideo> createState() => _AutoPlayVideoState();
+}
+
+class _AutoPlayVideoState extends State<AutoPlayVideo> with AutomaticKeepAliveClientMixin {
+  VideoPlayerController? _c;
+  bool _visible = false;
+  bool _initTried = false;
+
+  @override
+  bool get wantKeepAlive => true;
+
+  Future<void> _ensureController() async {
+    if (_c != null || _initTried == true) return;
+    _initTried = true;
+    final c = VideoPlayerController.networkUrl(Uri.parse(_abs(widget.videoUrl)));
+    await c.initialize();
+    await c.setLooping(true);
+    await c.setVolume(0.0);
+    await c.setPlaybackSpeed(1.0);
+    setState(() => _c = c);
+    if (_visible) c.play();
+  }
+
+  @override
+  void dispose() {
+    _c?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+
+    final poster = Image.network(
+      _abs(widget.posterUrl),
+      fit: BoxFit.cover,
+    );
+
+    return VisibilityDetector(
+      key: ValueKey('vid::${widget.videoUrl}'),
+      onVisibilityChanged: (info) async {
+        final frac = info.visibleFraction;
+        final shouldPlay = frac >= 0.6;
+        setState(() => _visible = shouldPlay);
+        if (shouldPlay) {
+          await _ensureController();
+          _c?.play();
+        } else {
+          _c?.pause();
+        }
+      },
+      child: AspectRatio(
+        aspectRatio: _c?.value.aspectRatio == 0 || _c == null ? 16 / 9 : _c!.value.aspectRatio,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          clipBehavior: Clip.hardEdge,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              poster,
+              if (_c != null && _c!.value.isInitialized) VideoPlayer(_c!),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _abs(String u) => u.startsWith('http') ? u : 'https://anime-seek.com$u';
+}
+class CommentsSheet extends StatefulWidget {
+  final int postId;
+  final int postUserId;
+  final String username;
+  final String avatarUrl;
+  final String content;
+
+  final String? imageUrl;
+  final String? videoUrl; // optional
+  final String? backgroundColorHex;
+
+  final void Function(int userId) onAvatarTap;
+
+  final String? summaryText;
+  final String? summaryThumbUrl;
+
+  final PollData? poll;
+
+  const CommentsSheet({
+    Key? key,
+    required this.postId,
+    required this.postUserId,
+    required this.username,
+    required this.avatarUrl,
+    required this.content,
+    required this.onAvatarTap,
+    this.imageUrl,
+    this.videoUrl,
+    this.backgroundColorHex,
+    this.poll,
+    this.summaryText,
+    this.summaryThumbUrl,
+  }) : super(key: key);
+
+  @override
+  State<CommentsSheet> createState() => _CommentsSheetState();
+}
+
+class _CommentsSheetState extends State<CommentsSheet> {
+  final TextEditingController _rootCtrl = TextEditingController();
+  static const int _COMMENTS_LIMIT = 50;
+
+  bool _truncated = false;
+  bool _sendingRoot = false;
+  bool _loading = true;
+  int? _nextBeforeId;
+  bool _hasMore = false;
+  bool _loadingOlder = false;
+  int _totalCount = 0;
+  String? _error;
+  bool _didVote = false;
+
+  int? _replyUIUnderId;
+  int? _replyParentCommentId;
+  String? _replyPrefill;
+
+  bool _alive = false;
+  void _ss(VoidCallback fn) {
+    if (_alive && mounted) setState(fn);
+  }
+
+  PollData? _pollLocal;
+  bool _voting = false;
+
+  int? _myId;
+
+  List<Map<String, dynamic>> _flat = [];
+  List<_CommentNode> _tree = [];
+
+  final Map<int, TextEditingController> _replyCtrls = {};
+  final Map<int, TextEditingController> _editCtrls = {};
+  final Set<int> _replying = <int>{};
+  final Set<int> _editing = <int>{};
+  final Set<int> _pending = <int>{};
+  final Set<int> _expanded = <int>{};
+  final Set<int> _loadingReplies = <int>{};
+  final Set<int> _deletedReplyIds = <int>{};
+  final Set<int> _dirtyParents = <int>{};
+  final Map<int, int> _replyCountOverride = <int, int>{};
+
+  Color? _parseHex(String? hex) {
+    if (hex == null) return null;
+    var v = hex.trim();
+    if (v.isEmpty) return null;
+    if (!v.startsWith('#')) v = '#$v';
+    v = v.replaceFirst('#', '');
+    if (v.length == 6) return Color(int.parse('FF$v', radix: 16));
+    if (v.length == 8) return Color(int.parse(v, radix: 16));
+    return null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _alive = true;
+    _bootstrap();
+    _pollLocal = widget.poll;
+  }
+
+  @override
+  void dispose() {
+    _alive = false;
+    _rootCtrl.dispose();
+    for (final c in _replyCtrls.values) c.dispose();
+    for (final c in _editCtrls.values) c.dispose();
+    super.dispose();
+  }
+
+  PollData _applyLocalVote(PollData old, int optionId) {
+    final already = old.votedOptionIds.contains(optionId);
+    // optimistic single-choice behavior; expand if you support multiple.
+    final newVoted = already
+        ? old.votedOptionIds
+        : <int>[optionId];
+
+    final newOpts = old.options.map((o) {
+      if (o.id == optionId && !already) {
+        return PollOption(id: o.id, idx: o.idx, text: o.text, voteCount: o.voteCount + 1);
+      }
+      return o;
+    }).toList();
+
+    final newTotal = already ? old.totalVotes : old.totalVotes + 1;
+
+    return PollData(
+      isPoll: old.isPoll,
+      question: old.question,
+      options: newOpts,
+      votedOptionIds: newVoted,
+      multiple: old.multiple,
+      allowChange: old.allowChange,
+      totalVotes: newTotal,
+    );
+  }
+
+  Future<void> _voteInSheet(int optionId) async {
+    final poll = _pollLocal;
+    if (poll == null) return;
+
+    if (poll.votedOptionIds.isNotEmpty && !poll.allowChange) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Your vote was already counted.')),
+      );
+      return;
+    }
+
+    setState(() => _voting = true);
+    final uri = Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/poll/vote');
+
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.post(
+        uri,
+        headers: _jsonHeaders(headers),
+        body: jsonEncode({'option_ids': [optionId]}),
+      );
+
+      if (!mounted) return;
+
+      if (res.statusCode == 200) {
+        setState(() {
+          _pollLocal = _applyLocalVote(poll, optionId); // optimistic increment
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Vote recorded')),
+        );
+        Navigator.of(context).pop(true); // refresh feed on close
+        return;
+      }
+
+      String? friendly = _friendlyVoteError(res, endpoint: uri.path);
+      friendly ??= (res.statusCode == 500 ? 'Your vote was already counted.' : null);
+
+      if ((friendly ?? '').contains('already counted')) {
+        // Mark as voted locally (without changing counts—we don’t know which option server stored)
+        setState(() {
+          _pollLocal = PollData(
+            isPoll: poll.isPoll,
+            question: poll.question,
+            options: poll.options,
+            votedOptionIds: poll.votedOptionIds.isEmpty ? <int>[optionId] : poll.votedOptionIds,
+            multiple: poll.multiple,
+            allowChange: poll.allowChange,
+            totalVotes: poll.totalVotes,
+          );
+        });
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(friendly!)));
+        Navigator.of(context).pop(true);
+        return;
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(friendly ?? 'Vote failed (${res.statusCode})')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _voting = false);
+    }
+  }
+
+
+  Future<void> _bootstrap() async {
+    _ss(() => _loading = true);
+    try {
+      final me = await AuthService.getCurrentUser();
+      _myId = (me['id'] is num) ? (me['id'] as num).toInt() : int.tryParse('${me['id']}');
+      if (!_alive) return;
+      await _loadComments();
+    } catch (e) {
+      debugPrint('comments bootstrap error: $e');
+    } finally {
+      _ss(() => _loading = false);
+    }
+  }
+
+
+  Map<String, dynamic> _normalizeComment(Map raw) {
+    final m = Map<String, dynamic>.from(raw);
+
+    // self id (the one to DELETE)
+    final self = m['reply_id'] ?? m['id'] ?? m['commentId'] ?? m['comment_id'];
+
+    // parent id (threading only)
+    final parent = m['parent_id'] ??
+        m['parentId'] ??
+        m['parent_comment_id'] ??
+        m['in_reply_to_id'] ??
+        m['reply_to_id'] ??
+        m['comment_parent_id'] ??
+        m['comment_id']; // some APIs use comment_id for parent
+
+    if (self != null) m['id'] = (self is num) ? self.toInt() : int.tryParse('$self') ?? self;
+    if (parent != null) m['parent_id'] = (parent is num) ? parent.toInt() : int.tryParse('$parent') ?? parent;
+
+    return m;
+  }
+
+
+  int? _parentIdForReply(int replyId) {
+    _CommentNode? hit;
+    _CommentNode? _find(List<_CommentNode> nodes) {
+      for (final n in nodes) {
+        if (_intOf(n.data['id']) == replyId && (n.data['parent_id'] != null || n.data['comment_id'] != null)) {
+          return n;
+        }
+        final child = _find(n.children);
+        if (child != null) return child;
+      }
+      return null;
+    }
+
+    hit = _find(_tree);
+    if (hit != null) {
+      final p = hit.data['parent_id'] ?? hit.data['comment_id'];
+      return _intNullable(p);
+    }
+
+    final m = _flat.firstWhere(
+          (m) => _intOf(m['id']) == replyId,
+      orElse: () => const <String, dynamic>{},
+    );
+    if (m.isNotEmpty) {
+      final p = m['parent_id'] ?? m['comment_id'];
+      return _intNullable(p);
+    }
+    return null;
+  }
+
+  void _removeLocalReplyEverywhere(int replyId) {
+    _flat.removeWhere((m) => _intOf(m['id']) == replyId);
+    void _prune(List<_CommentNode> nodes) {
+      nodes.removeWhere((n) => _intOf(n.data['id']) == replyId);
+      for (final n in nodes) {
+        if (n.children.isNotEmpty) _prune(n.children);
+      }
+    }
+    _prune(_tree);
+  }
+
+  void _startReplyUI({required int underRowId, required int parentCommentId, String? prefill}) {
+    setState(() {
+      _replyUIUnderId = underRowId;
+      _replyParentCommentId = parentCommentId;
+      _replyPrefill = prefill ?? '';
+      _replyCtrls[parentCommentId] ??= TextEditingController();
+      // set prefill only if empty to avoid overwriting ongoing typing
+      final c = _replyCtrls[parentCommentId]!;
+      if (c.text.isEmpty && (_replyPrefill?.isNotEmpty ?? false)) {
+        c.text = _replyPrefill!;
+        c.selection = TextSelection.fromPosition(TextPosition(offset: c.text.length));
+      }
+    });
+  }
+
+  void _cancelReplyUI() {
+    setState(() {
+      _replyUIUnderId = null;
+      _replyParentCommentId = null;
+      _replyPrefill = null;
+    });
+  }
+
+  Future<void> _loadReplies(int parentId) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      if (!_alive) return;
+
+      final uri = Uri.parse(
+        'https://anime-seek.com/fastapi/comments/$parentId/replies?limit=50',
+      );
+      final r = await http.get(uri, headers: headers);
+      if (!_alive) return;
+      if (r.statusCode != 200) return;
+
+      final decoded = jsonDecode(utf8.decode(r.bodyBytes));
+      final List<dynamic> raw = decoded is List
+          ? decoded
+          : (decoded is Map && decoded['items'] is List
+          ? decoded['items'] as List
+          : const []);
+
+      if (!_alive) return;
+
+      final children = raw.whereType<Map>().map<_CommentNode>((e) {
+        final m = _normalizeComment(Map<String, dynamic>.from(e));
+        m['_is_reply'] = true;
+        m['parent_id'] = parentId;
+        return _CommentNode(data: m, children: <_CommentNode>[]);
+      }).toList();
+
+      if (!_alive) return;
+
+      _applyRepliesToTree(parentId, children);
+      _ss(() {
+        _expanded.add(parentId);
+      });
+    } catch (e) {
+      debugPrint('loadReplies($parentId) error: $e');
+    } finally {
+      _ss(() => _loadingReplies.remove(parentId));
+    }
+  }
+
+
+
+  _CommentNode? _findNodeById(List<_CommentNode> roots, int id) {
+    for (final n in roots) {
+      final nid = _intOf(n.data['id']);
+      if (nid == id) return n;
+      final hit = _findNodeById(n.children, id);
+      if (hit != null) return hit;
+    }
+    return null;
+  }
+
+  void _toggleReplies(int parentId) async {
+    final expanding = !_expanded.contains(parentId);
+
+    setState(() {
+      if (expanding) {
+        _expanded.add(parentId);
+      } else {
+        _expanded.remove(parentId);
+      }
+    });
+
+    if (expanding) {
+      final n = _findNodeById(_tree, parentId);
+      if (n == null || n.children.isEmpty) {
+        setState(() => _loadingReplies.add(parentId));
+        await _loadReplies(parentId);
+        if (mounted) setState(() => _loadingReplies.remove(parentId));
+      } else {
+        _replyCountOverride[parentId] = n.children.length;
+        if (mounted) setState(() {});
+      }
+    }
+  }
+
+
+
+  Future<void> _sendReply(int parentId) async {
+    final ctrl = _replyCtrls[parentId];
+    final replyText = ctrl?.text.trim() ?? '';
+    if (replyText.isEmpty || _pending.contains(parentId)) return;
+
+    setState(() => _pending.add(parentId));
+    try {
+      final auth = await AuthService.authHeaders;
+      final uri  = Uri.parse('https://anime-seek.com/fastapi/comments/$parentId/replies');
+
+      // JSON first, fallback to form if needed
+      var res = await http.post(
+        uri,
+        headers: _jsonHeaders(auth),
+        body: jsonEncode({'content': replyText}),
+      );
+      if (res.statusCode == 422 || res.statusCode == 415) {
+        res = await http.post(
+          uri,
+          headers: _formHeaders(auth),
+          body: {'content': replyText},
+        );
+      }
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        // Clear UI and ensure the thread is open
+        ctrl?.clear();
+        setState(() {
+          _replying.remove(parentId);
+          _expanded.add(parentId);
+        });
+
+        // SINGLE refresh source of truth
+        await _loadReplies(parentId);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Reply failed: ${res.statusCode}')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+    } finally {
+      if (mounted) setState(() => _pending.remove(parentId));
+    }
+  }
+
+
+
+  int _ownerIdOf(Map<String, dynamic> m) {
+    final ids = [
+      m['user_id'], m['author_id'], m['owner_id'],
+      (m['user'] is Map) ? (m['user'] as Map)['id'] : null,
+    ];
+    for (final v in ids) {
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      final p = int.tryParse('$v');
+      if (p != null) return p;
+    }
+    return 0;
+  }
+
+  /// Try to fetch the comment to inspect what the server says its owner is.
+  /// Returns a map like { "ok": bool, "owner_id": int, "raw": Map? }.
+  /// Try to determine the owner of a comment without calling GET /comments/{id}
+  /// Falls back to searching the currently loaded comments/replies we have in memory.
+  Map<String, dynamic> _inspectCommentOwnerLocal(int id) {
+    // Search flat list first
+    final hit = _flat.firstWhere(
+          (m) => _intOf(m['id']) == id,
+      orElse: () => <String, dynamic>{},
+    );
+    if (hit.isNotEmpty) {
+      return {
+        'ok': true,
+        'owner_id': _ownerIdOf(hit),
+        'raw': hit,
+        'source': 'flat'
+      };
+    }
+
+    // Walk the tree as a fallback
+    _CommentNode? _find(List<_CommentNode> nodes, int target) {
+      for (final n in nodes) {
+        if (_intOf(n.data['id']) == target) return n;
+        final c = _find(n.children, target);
+        if (c != null) return c;
+      }
+      return null;
+    }
+
+    final node = _find(_tree, id);
+    if (node != null) {
+      return {
+        'ok': true,
+        'owner_id': _ownerIdOf(node.data),
+        'raw': node.data,
+        'source': 'tree'
+      };
+    }
+
+    return {'ok': false, 'owner_id': 0, 'source': 'none'};
+  }
+
+  void _applyRepliesToTree(int parentId, List<_CommentNode> incoming) {
+    final parent = _findNodeById(_tree, parentId);
+    if (parent == null) return;
+
+    final byId = <int, _CommentNode>{
+      for (final c in parent.children) _intOf(c.data['id']): c
+    };
+    for (final inc in incoming) {
+      byId[_intOf(inc.data['id'])] = inc; // overwrite duplicates by id
+    }
+
+    // stable, asc by created time, then id
+    final kids = byId.values.toList()
+      ..sort((a, b) {
+        final ta = _parseWhen(a.data);
+        final tb = _parseWhen(b.data);
+        final cmp = ta.compareTo(tb);
+        return (cmp != 0) ? cmp : _intOf(a.data['id']).compareTo(_intOf(b.data['id']));
+      });
+
+    setState(() {
+      parent.children = kids;
+
+      _replyCountOverride[parentId] = parent.children.length;
+    });
+  }
+
+  Future<void> _loadComments({int? beforeId, bool append = false}) async {
+    try {
+      final headers = await AuthService.authHeaders;
+      if (!_alive) return;
+
+      final qp = <String, String>{'limit': '50'};
+      if (beforeId != null) qp['before_id'] = '$beforeId';
+
+      final uri = Uri.https('anime-seek.com', '/fastapi/posts/${widget.postId}/comments', qp);
+      final res = await http.get(uri, headers: headers)
+          .timeout(const Duration(seconds: 15));
+      if (!_alive) return;
+
+      if (res.statusCode == 200) {
+        final body = utf8.decode(res.bodyBytes);
+        final map = json.decode(body) as Map<String, dynamic>;
+        final raw = (map['items'] as List).cast<Map<String, dynamic>>();
+        final items = raw.map((e) => _normalizeComment(Map<String, dynamic>.from(e))).toList().reversed.toList();
+
+        final total = (map['total_count'] as num?)?.toInt() ?? items.length;
+        final hasMore = map['has_more'] == true;
+        final nextBeforeId = map['next_before_id'] as int?;
+
+        _ss(() {
+          _totalCount = total;
+          _hasMore = hasMore;
+          _nextBeforeId = nextBeforeId;
+
+          if (!append) {
+            _flat = items;
+          } else {
+            _flat.addAll(items);
+          }
+          _tree = _buildTree(_flat);
+        });
+      } else {
+        _ss(() => _error = 'Failed (${res.statusCode})');
+      }
+    } catch (e) {
+      _ss(() => _error = 'Error: $e');
+    }
+  }
+
+  Future<void> _loadOlder() async {
+    if (!_hasMore || _loadingOlder || _nextBeforeId == null) return;
+    _ss(() => _loadingOlder = true);
+    try {
+      await _loadComments(beforeId: _nextBeforeId, append: true);
+    } catch (e) {
+      _ss(() => _error = 'Error: $e');
+    } finally {
+      _ss(() => _loadingOlder = false);
+    }
+  }
+
+  Widget _buildInlineReply(Map<String, dynamic> r) {
+    final cs = Theme.of(context).colorScheme;
+
+    final user = (r['user'] as Map?)?.cast<String, dynamic>() ?? {};
+    final uid = _intOf(user['id']);
+    final name = (user['display_name'] ?? 'User').toString();
+    final avatar = _full((user['avatar_url'] ?? '/uploads/default_avatar.jpg').toString());
+
+    final id = _intOf(r['id']);
+    final isMine = (_myId != null && _ownerIdOf(r) == _myId);
+
+    final editing = _editing.contains(id);
+    final busy    = _pending.contains(id);
+
+    // ensure controller exists and is in sync
+    _editCtrls[id] ??= TextEditingController(text: (r['content'] ?? '').toString());
+    if (!editing) {
+      // keep controller fresh when not actively editing, in case list was reloaded
+      _editCtrls[id]!.text = (r['content'] ?? '').toString();
+    }
+
+    void _openProfile() {
+      if (uid > 0) widget.onAvatarTap(uid);
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, bottom: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          GestureDetector(
+            onTap: _openProfile,
+            child: CircleAvatar(radius: 12, backgroundImage: NetworkImage(avatar)),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Header row: name • time • (edited) • actions
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(fontWeight: FontWeight.w600, color: cs.onSurface),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      _formatFullDateTime(_parseWhen(r).toLocal()),
+                      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                    ),
+                    if (_wasEdited(r)) ...[
+                      const SizedBox(width: 6),
+                      Text('edited', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                    ],
+                    if (isMine) ...[
+                      const SizedBox(width: 4),
+                      TextButton(
+                        onPressed: busy ? null : () => setState(() => _editing.toggle(id)),
+                        style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(40, 28)),
+                        child: const Text('Edit'),
+                      ),
+                      TextButton(
+                        onPressed: busy ? null : () => _delete(id),
+                        style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(40, 28)),
+                        child: const Text('Delete'),
+                      ),
+                    ],
+                  ],
+                ),
+
+                // Body (text or editor)
+                if (!editing)
+                  Text(
+                    (r['content'] ?? '').toString(),
+                    style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant, height: 1.25),
+                  )
+                else
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextField(
+                        controller: _editCtrls[id],
+                        minLines: 1,
+                        maxLines: 4,
+                        decoration: InputDecoration(
+                          isDense: true,
+                          filled: true,
+                          fillColor: cs.surfaceVariant.withOpacity(.35),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: BorderSide.none,
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          FilledButton.tonal(
+                            onPressed: busy ? null : () => _saveEdit(id),
+                            child: busy
+                                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                                : const Text('Save'),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: () => setState(() => _editing.remove(id)),
+                            child: const Text('Cancel'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _sendRoot() async {
+    final text = _rootCtrl.text.trim();
+    if (text.isEmpty || _sendingRoot) return;
+    setState(() => _sendingRoot = true);
+
+    try {
+      final auth = await AuthService.authHeaders;
+      final res = await http.post(
+        Uri.parse('https://anime-seek.com/fastapi/posts/${widget.postId}/comments'),
+        headers: _jsonHeaders(auth),
+        body: jsonEncode({'content': text}),
+      );
+
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final body = utf8.decode(res.bodyBytes);
+        final newComment = _normalizeComment(jsonDecode(body) as Map<String, dynamic>);
+
+        _rootCtrl.clear();
+
+        setState(() {
+          _flat.add(newComment);
+          _tree = _buildTree(_flat);
+          _totalCount += 1;
+        });
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Comment posted')),
+          );
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Failed: ${res.statusCode}')),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sendingRoot = false);
+    }
+  }
+  Map<String, String> _formHeaders(Map<String, String> base) {
+    final h = Map<String, String>.from(base);
+    h.removeWhere((k, _) => k.toLowerCase() == 'content-type');
+    h['Content-Type'] = 'application/x-www-form-urlencoded; charset=utf-8';
+    h['Accept'] = 'application/json';
+    return h;
+  }
+  Future<void> _saveEdit(int id) async {
+    final ctrl = _editCtrls[id];
+    if (ctrl == null) return;
+    final newText = ctrl.text.trim();
+    if (newText.isEmpty) return;
+
+    setState(() => _pending.add(id));
+    try {
+      final auth = await AuthService.authHeaders;
+      final res = await http.patch(
+        Uri.parse('https://anime-seek.com/fastapi/comments/$id'),
+        headers: _jsonHeaders(auth),
+        body: jsonEncode({'content': newText}),
+      );
+      if (res.statusCode == 200) {
+        _editing.remove(id);
+        await _loadComments();
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Update failed: ${res.statusCode}')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    } finally {
+      if (mounted) setState(() => _pending.remove(id));
+    }
+  }
+
+  static const _base = 'https://anime-seek.com/fastapi';
+
+  _CommentNode? _removeNodeById(List<_CommentNode> roots, int id) {
+    for (int i = 0; i < roots.length; i++) {
+      final n = roots[i];
+      if (_intOf(n.data['id']) == id) {
+        return roots.removeAt(i);
+      }
+      final removed = _removeNodeById(n.children, id);
+      if (removed != null) return removed;
+    }
+    return null;
+  }
+
+  Future<void> _delete(int id) async {
+    setState(() => _pending.add(id));
+    try {
+      final headers = await AuthService.authHeaders;
+
+      // Try reply delete first; if 404, try comment
+      var res = await http.delete(
+        Uri.parse('https://anime-seek.com/fastapi/replies/$id'),
+        headers: headers,
+      );
+
+      if (res.statusCode == 404) {
+        res = await http.delete(
+          Uri.parse('https://anime-seek.com/fastapi/comments/$id'),
+          headers: headers,
+        );
+      }
+      if (res.statusCode != 200) return;
+
+      // Remove from tree
+      final removed = _removeNodeById(_tree, id);
+      if (removed != null) {
+        // if we removed a reply, decrement parent’s cached collapsed count
+        final parentId = _intOf(removed.data['parent_id']);
+        if (parentId > 0) {
+          final cur = _replyCountOverride[parentId] ?? 0;
+          _replyCountOverride[parentId] = (cur > 0 ? cur - 1 : 0);
+        }
+      }
+      setState(() {});
+    } finally {
+      setState(() => _pending.remove(id));
+    }
+  }
+  @override
+Widget build(BuildContext context) {
+  return Padding(
+    padding: EdgeInsets.only(
+      bottom: MediaQuery.of(context).viewInsets.bottom,
+    ),
+    child: DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.94,
+      minChildSize: 0.60,
+      maxChildSize: 0.98,
+      builder: (ctx, scrollController) {
+        final cs = Theme.of(ctx).colorScheme;
+
+        // Build comment widgets once for the sliver list
+        List<Widget> _commentWidgets() {
+          if (_loading) {
+            return const [
+              Padding(
+                padding: EdgeInsets.all(16),
+                child: Center(
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              )
+            ];
+          }
+          if (_tree.isEmpty) {
+            return [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Center(
+                  child: Text(
+                    'No comments yet',
+                    style: TextStyle(color: cs.onSurfaceVariant),
+                  ),
+                ),
+              )
+            ];
+          }
+          return [
+            for (final node in _tree)
+              KeyedSubtree(
+                key: ValueKey('c_${_intOf(node.data['id'])}'),
+                child: _buildNode(node, 0),
+              )
+          ];
+        }
+
+        return ClipRRect(
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          child: Container(
+            color: _parseHex(widget.backgroundColorHex) ?? cs.surface,
+            child: Material(
+              type: MaterialType.transparency,
+              child: CustomScrollView(
+                controller: scrollController,
+                slivers: [
+                  // Pull bar
+                  SliverToBoxAdapter(
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 8),
+                        Container(
+                          width: 46,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            color: cs.outlineVariant,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                    ),
+                  ),
+
+                  // Header (avatar + title)
+                  SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 10),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            GestureDetector(
+                              behavior: HitTestBehavior.opaque,
+                              onTap: () {
+                                if (widget.postUserId > 0) {
+                                  widget.onAvatarTap(widget.postUserId);
+                                }
+                              },
+                              child: CircleAvatar(
+                                radius: 22,
+                                backgroundImage: NetworkImage(_full(widget.avatarUrl)),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Padding(
+                                padding: const EdgeInsets.only(top: 2),
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    if (widget.postUserId > 0) {
+                                      widget.onAvatarTap(widget.postUserId);
+                                    }
+                                  },
+                                  child: Text(
+                                    widget.username,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 16,
+                                      color: cs.onSurface,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.close),
+                              onPressed: () => Navigator.of(context).pop(_didVote),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          ],
+                        ),
+                        if (widget.content.trim().isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          Text(
+                            widget.content.trim(),
+                            style: TextStyle(
+                              fontSize: 14,
+                              height: 1.45,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+                  if ((widget.summaryText ?? '').isNotEmpty)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 6, 12, 8),
+                        child: _SummaryBlock(
+                          text: widget.summaryText!,
+                          thumbUrl: widget.summaryThumbUrl,
+                        ),
+                      ),
+                    ),
+
+                  // Banner
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                      child: MaterialBanner(
+                        backgroundColor: cs.surfaceVariant.withOpacity(.35),
+                        content: const Text(
+                          'For long threads, continue on Discord in #app-post',
+                        ),
+                        leading: const Icon(Icons.forum, size: 20),
+                        actions: [
+                          TextButton.icon(
+                            onPressed: () async {
+                              final uri = Uri.parse('https://discord.gg/ZGsPCX3r');
+                              if (await canLaunchUrl(uri)) {
+                                await launchUrl(uri, mode: LaunchMode.externalApplication);
+                              } else {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('Couldn’t open Discord link')),
+                                );
+                              }
+                            },
+                            icon: const Icon(Icons.launch, size: 18),
+                            label: const Text('Open Discord'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  if ((widget.videoUrl ?? '').isNotEmpty || (widget.imageUrl ?? '').isNotEmpty)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 12),
+                        child: GestureDetector(
+                          onTap: () {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => FullscreenImageViewer(
+                                  tag: 'sheet-media-${widget.postId}',
+                                  imageUrl: _absUrl(widget.imageUrl ?? ''),
+                                  videoUrl: (widget.videoUrl?.isNotEmpty == true)
+                                      ? _absUrl(widget.videoUrl!)
+                                      : null,
+                                ),
+                              ),
+                            );
+                          },
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: (widget.videoUrl != null && widget.videoUrl!.isNotEmpty)
+                                ? _InlineAutoVideo(
+                                    posterUrl: _absUrl(widget.imageUrl ?? ''),
+                                    videoUrl: _absUrl(widget.videoUrl!),
+                                  )
+                                : _PostPreviewImage(url: _absUrl(widget.imageUrl!)),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // Poll (if any)
+                  if (_pollLocal?.isPoll == true)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+                        child: _PollInSheet(
+                          poll: _pollLocal!,
+                          onVote: _voteInSheet,
+                          busy: _voting,
+                        ),
+                      ),
+                    ),
+
+                  // Divider
+                  SliverToBoxAdapter(
+                    child: Divider(height: 1, color: cs.outlineVariant.withOpacity(.6)),
+                  ),
+
+                  // Comments list
+                  SliverList(
+                    delegate: SliverChildListDelegate(_commentWidgets()),
+                  ),
+
+                  // “Load older” + counts
+                  if (_totalCount > 50 || _hasMore)
+                    SliverToBoxAdapter(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                'Showing latest ${_flat.length} of $_totalCount',
+                                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
+                              ),
+                            ),
+                            if (_hasMore)
+                              TextButton(
+                                onPressed: _loadingOlder ? null : _loadOlder,
+                                child: _loadingOlder
+                                    ? const SizedBox(
+                                        width: 16,
+                                        height: 16,
+                                        child: CircularProgressIndicator(strokeWidth: 2),
+                                      )
+                                    : const Text('Load older (50)'),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                  // Root input
+                  SliverToBoxAdapter(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _rootCtrl,
+                              minLines: 1,
+                              maxLines: 4,
+                              decoration: InputDecoration(
+                                hintText: 'Write a comment…',
+                                isDense: true,
+                                filled: true,
+                                fillColor: cs.surfaceVariant.withOpacity(.35),
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: BorderSide.none,
+                                ),
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 10,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          _sendingRoot
+                              ? const SizedBox(
+                                  width: 22,
+                                  height: 22,
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                )
+                              : IconButton.filledTonal(
+                                  icon: const Icon(Icons.send),
+                                  onPressed: _sendRoot,
+                                  tooltip: 'Send',
+                                  style: IconButton.styleFrom(
+                                    visualDensity: VisualDensity.compact,
+                                  ),
+                                ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    ),
+  );
+}
+
+  // ========= Helpers below (unchanged from your version) =========
+
+  String _fixAniListCdn(String url) {
+    final u = url.trim();
+    if (u.startsWith('https://img.anili.st/media/') && u.endsWith('.jpg')) {
+      return u.substring(0, u.length - 4); // 400 → strip ".jpg"
+    }
+    return u;
+  }
+
+  String _briefSummary({
+    required String text,
+    required bool isPoll,
+    required String pollQ,
+    required bool hasImage,
+    required bool hasVideo,
+    int maxChars = 160,
+  }) {
+    String s = text.trim().isNotEmpty
+        ? text.trim()
+        : (isPoll
+        ? (pollQ.trim().isNotEmpty ? '📊 $pollQ' : '📊 Poll')
+        : (hasVideo ? '🎬 Video attached' : (hasImage ? '🖼️ Image attached' : 'Post')));
+    if (s.length > maxChars) s = '${s.substring(0, maxChars).trim()}…';
+    return s;
+  }
+
+  String _full(String? url) {
+    if (url == null || url.isEmpty) {
+      return 'https://anime-seek.com/uploads/user_avatars/default_avatar.jpg';
+
+    }
+    return url.startsWith('http') ? url : 'https://anime-seek.com$url';
+  }
+
+  DateTime _dt(dynamic mOrString) {
+    if (mOrString is Map) {
+      final m = mOrString.cast<String, dynamic>();
+      final v = m['created_at'] ?? m['createdAt'] ?? m['createdAtUtc'];
+      if (v is String && v.isNotEmpty) {
+        try { return DateTime.parse(v); } catch (_) {}
+      }
+      if (v is int) {
+        try { return DateTime.fromMillisecondsSinceEpoch(v); } catch (_) {}
+      }
+      return DateTime.fromMillisecondsSinceEpoch(0);
+    }
+    if (mOrString is String && mOrString.isNotEmpty) {
+      try { return DateTime.parse(mOrString); } catch (_) {}
+    }
+    return DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  int _intOf(dynamic v) {
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    return int.tryParse('$v') ?? 0;
+  }
+
+  List<_CommentNode> _buildTree(List<Map<String, dynamic>> flat) {
+    final hasNested = flat.any((m) =>
+    (m['replies'] is List && (m['replies'] as List).isNotEmpty) ||
+        (m['children'] is List && (m['children'] as List).isNotEmpty)
+    );
+
+    if (hasNested) {
+      final roots = flat.map((m) => _nodeFromNested(m)).toList();
+      _sortLevel(roots);
+      return roots;
+    }
+
+    final byId = <int, _CommentNode>{};
+    final roots = <_CommentNode>[];
+
+    for (final m in flat) {
+      byId[_intOf(m['id'])] = _CommentNode(data: m);
+    }
+
+    for (final n in byId.values) {
+      final pid = _parentIdOf(n.data);
+      if (pid == null) {
+        roots.add(n);
+      } else {
+        final p = byId[pid];
+        if (p != null) {
+          p.children.add(n);
+        } else {
+          roots.add(n);
+        }
+      }
+    }
+
+    _sortLevel(roots);
+    return roots;
+  }
+
+  Widget _buildNode(
+      _CommentNode node,
+      int depth, {
+        int? rootId,
+        int? rootReplyCount,
+      }) {
+    final cs = Theme.of(context).colorScheme;
+    final m = node.data;
+    final id = _intOf(m['id']);
+    final user = (m['user'] as Map?)?.cast<String, dynamic>() ?? {};
+    final uid = _intOf(user['id']);
+    final name = (user['display_name'] ?? 'User').toString();
+    final avatar = _full((user['avatar_url'] ?? '/uploads/default_avatar.jpg').toString());
+    final isMine = (_myId != null && _ownerIdOf(m) == _myId);
+
+
+    final isReplyNode = depth > 0;
+    final parentId = isReplyNode ? (rootId ?? id) : id;
+
+    final loadedChildren = node.children.length;
+    final serverCount = isReplyNode ? (rootReplyCount ?? 0) : _intOf(m['reply_count']);
+    final expanded = _expanded.contains(parentId);
+    final showCount = expanded
+        ? loadedChildren
+        : (_replyCountOverride[parentId] ?? serverCount);
+
+    final busy = _pending.contains(id);
+    final editing = _editing.contains(id);
+    final showReplyBox = (_replyUIUnderId == id && _replyParentCommentId == parentId);
+
+    _editCtrls[id] ??= TextEditingController(text: (m['content'] ?? '').toString());
+    _replyCtrls[parentId] ??= TextEditingController();
+
+    void _openProfile() {
+      if (uid > 0) widget.onAvatarTap(uid);
+    }
+
+    return Padding(
+      padding: EdgeInsets.only(left: (depth * 14).toDouble(), bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ===== Parent/reply row (ALWAYS visible) =====
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              GestureDetector(
+                onTap: _openProfile,
+                child: CircleAvatar(radius: 14, backgroundImage: NetworkImage(avatar)),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontWeight: FontWeight.w600, color: cs.onSurface),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          _formatFullDateTime(_parseWhen(m).toLocal()),
+                          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                        ),
+                        if (_wasEdited(m)) ...[
+                          const SizedBox(width: 6),
+                          Text('edited', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                        ],
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    if (!editing)
+                      Text(
+                        (m['content'] ?? '').toString(),
+                        style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant, height: 1.25),
+                      )
+                    else
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          TextField(
+                            controller: _editCtrls[id],
+                            minLines: 1,
+                            maxLines: 4,
+                            decoration: InputDecoration(
+                              isDense: true,
+                              filled: true,
+                              fillColor: cs.surfaceVariant.withOpacity(.35),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(10),
+                                borderSide: BorderSide.none,
+                              ),
+                              contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            children: [
+                              FilledButton.tonal(
+                                onPressed: busy ? null : () => _saveEdit(id),
+                                child: busy
+                                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                                    : const Text('Save'),
+                              ),
+                              const SizedBox(width: 8),
+                              TextButton(
+                                onPressed: () => setState(() => _editing.remove(id)),
+                                child: const Text('Cancel'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    Row(
+                      children: [
+                        // Reply
+                        TextButton(
+                          onPressed: busy
+                              ? null
+                              : () {
+                            if (showReplyBox) {
+                              _cancelReplyUI();
+                            } else {
+                              final mention = '@$name ';
+                              _startReplyUI(
+                                underRowId: id,            // show the box under THIS row
+                                parentCommentId: parentId, // but submit to the top-level parent
+                                prefill: mention,
+                              );
+                            }
+                          },
+                          style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(40, 28)),
+                          child: Text(showReplyBox ? 'Cancel' : 'Reply'),
+                        ),
+
+                        // Edit/Delete (only if mine)
+                        if (isMine)
+                          TextButton(
+                            onPressed: busy ? null : () => setState(() => _editing.toggle(id)),
+                            style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(40, 28)),
+                            child: const Text('Edit'),
+                          ),
+                        if (isMine)
+                          TextButton(
+                            onPressed: busy ? null : () => _delete(id),
+                            style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(40, 28)),
+                            child: const Text('Delete'),
+                          ),
+                      ],
+                    ),
+
+                    if (showReplyBox) ...[
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _replyCtrls[parentId] ??= TextEditingController(),
+                              minLines: 1,
+                              maxLines: 4,
+                              decoration: InputDecoration(
+                                hintText: 'Reply…',
+                                isDense: true,
+                                filled: true,
+                                fillColor: cs.surfaceVariant.withOpacity(.35),
+                                border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10),
+                                  borderSide: BorderSide.none,
+                                ),
+                                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          busy
+                              ? const SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2))
+                              : IconButton.filledTonal(
+                            icon: const Icon(Icons.send),
+                            onPressed: () => _sendReply(parentId),
+                            tooltip: 'Send reply',
+                            style: IconButton.styleFrom(visualDensity: VisualDensity.compact),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
+
+          // ===== Toggle row (only for top-level comments) =====
+          if (!isReplyNode && (showCount > 0 || expanded)) ...[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton.icon(
+                onPressed: () => _toggleReplies(parentId),
+                icon: expanded
+                    ? const Icon(Icons.expand_less, size: 18)
+                    : const Icon(Icons.expand_more, size: 18),
+                label: Text(expanded ? 'Hide replies' : 'View replies ($showCount)'),
+                style: TextButton.styleFrom(padding: EdgeInsets.zero),
+              ),
+            ),
+          ],
+
+// ===== Replies (only when expanded) =====
+          if (expanded) ...[
+            // Dedupe by reply id just before building widgets
+            Builder(
+              builder: (context) {
+                final seen = <int>{};
+                final renderedKids = <_CommentNode>[];
+                for (final c in node.children) {
+                  final rid = _intOf(c.data['id']);
+                  if (rid > 0 && seen.add(rid)) {
+                    renderedKids.add(c);
+                  }
+                }
+
+                if (renderedKids.isEmpty) {
+                  return const SizedBox.shrink();
+                }
+
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    for (final c in renderedKids)
+                      KeyedSubtree(
+                        key: ValueKey('r_${parentId}_${_intOf(c.data['id'])}'),
+                        child: _buildNode(
+                          c,
+                          depth + 1,
+                          rootId: parentId,
+                          rootReplyCount: serverCount,
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+// ------- helpers -------
+String _full(String? url) {
+  if (url == null || url.isEmpty) {
+    return 'https://anime-seek.com/uploads/user_avatars/default_avatar.jpg';
+  }
+  return url.startsWith('http') ? url : 'https://anime-seek.com$url';
+}
+
+
+
+
+class _CommentNode {
+  final Map<String, dynamic> data;
+  List<_CommentNode> children;
+  _CommentNode({required this.data, List<_CommentNode>? children}) : children = children ?? [];
+}
+
+// tiny Set<T>.toggle helper
+extension _Toggle<T> on Set<T> {
+  void toggle(T v) { contains(v) ? remove(v) : add(v); }
+}
+
+int? _parentIdOf(Map<String, dynamic> m) {
+  int? _from(dynamic v) => _intNullable(v);
+
+  // 1) Common scalar keys.
+  const scalarKeys = [
+    'parent_id',
+    'parentId',
+    'parent_comment_id',
+    'parentCommentId',
+    'reply_to_id',
+    'replyToId',
+    'reply_to_comment_id',
+    'in_reply_to_id',
+    'in_reply_to_comment_id',
+  ];
+  for (final k in scalarKeys) {
+    if (m.containsKey(k)) {
+      final id = _from(m[k]);
+      if (id != null && id > 0) return id;
+    }
+  }
+
+  if (m.containsKey('comment_id')) {
+    final id = _from(m['comment_id']);
+    if (id != null && id > 0 && id != _intOf(m['id'])) return id;
+  }
+
+
+  const nestedKeys = ['parent', 'parent_comment', 'reply_to', 'in_reply_to'];
+  for (final k in nestedKeys) {
+    final v = m[k];
+    if (v is Map) {
+      final id = _from(v['id'] ?? v['comment_id'] ?? v['commentId']);
+      if (id != null && id > 0) return id;
+    }
+  }
+
+  final rel = m['relationships'];
+  if (rel is Map) {
+    for (final k in ['parent', 'reply_to', 'in_reply_to']) {
+      final v = rel[k];
+      if (v is Map) {
+        final id = _from(v['id'] ?? v['comment_id'] ?? v['commentId']);
+        if (id != null && id > 0) return id;
+      }
+    }
+  }
+
+  for (final e in m.entries) {
+    final k = e.key.toString().toLowerCase();
+    if (k == 'post_id' || k == 'postid') continue; // do not treat post id as parent
+    if ((k.contains('parent') || k.contains('reply') || k.contains('in_reply')) && k.endsWith('id')) {
+      final val = e.value;
+      final id = _from(val is Map ? (val['id'] ?? val['comment_id'] ?? val['commentId']) : val);
+      if (id != null && id > 0) return id;
+    }
+  }
+
+  return null;
+}
+
+_CommentNode _nodeFromNested(Map<String, dynamic> m) {
+  final kids = <_CommentNode>[];
+  final lists = [
+    (m['replies'] is List) ? (m['replies'] as List) : const <dynamic>[],
+    (m['children'] is List) ? (m['children'] as List) : const <dynamic>[],
+  ];
+  for (final lst in lists) {
+    for (final r in lst) {
+      if (r is Map<String, dynamic>) kids.add(_nodeFromNested(r));
+    }
+  }
+  return _CommentNode(data: m, children: kids);
+}
+
+void _sortLevel(List<_CommentNode> level) {
+  level.sort((a, b) {
+    final ta = _parseWhen(a.data);
+    final tb = _parseWhen(b.data);
+    final cmp = ta.compareTo(tb);              // ASC by created time
+    return (cmp != 0)
+        ? cmp
+        : _intOf(a.data['id']).compareTo(_intOf(b.data['id'])); // stable tie-break
+  });
+  for (final n in level) {
+    if (n.children.isNotEmpty) _sortLevel(n.children);
+  }
+}
+
+
+int _intOf(dynamic v) { if (v is int) return v; if (v is num) return v.toInt(); return int.tryParse('$v') ?? 0; }
+
+int? _intNullable(dynamic v) {
+  if (v == null) return null;
+  if (v is int) return v;
+  if (v is num) return v.toInt();
+  return int.tryParse('$v');
+}
+String _timeAgo(DateTime dt) {
+  final now = DateTime.now();
+  final d = now.difference(dt);
+  if (d.inSeconds < 60) return '${d.inSeconds}s';
+  if (d.inMinutes < 60) return '${d.inMinutes}m';
+  if (d.inHours   < 24) return '${d.inHours}h';
+  if (d.inDays    < 7 ) return '${d.inDays}d';
+  final weeks = (d.inDays / 7).floor();
+  if (weeks < 5) return '${weeks}w';
+  final months = (d.inDays / 30).floor();
+  if (months < 12) return '${months}mo';
+  final years = (d.inDays / 365).floor();
+  return '${years}y';
+}
+
+DateTime _parseWhen(Map<String, dynamic> m) {
+  // prefer created_at/createdAt; fallback to updated if created missing
+  final v = m['created_at'] ?? m['createdAt'] ?? m['createdAtUtc'] ?? m['updated_at'] ?? m['updatedAt'];
+  if (v is String && v.isNotEmpty) {
+    try { return DateTime.parse(v); } catch (_) {}
+  }
+  if (v is int) {
+    try { return DateTime.fromMillisecondsSinceEpoch(v); } catch (_) {}
+  }
+  return DateTime.fromMillisecondsSinceEpoch(0);
+}
+String _formatFullDateTime(DateTime dtLocal) {
+  final y = dtLocal.year.toString().padLeft(4, '0');
+  final m = dtLocal.month.toString().padLeft(2, '0');
+  final d = dtLocal.day.toString().padLeft(2, '0');
+  final hh = dtLocal.hour.toString().padLeft(2, '0');
+  final mm = dtLocal.minute.toString().padLeft(2, '0');
+  return '$y-$m-$d • $hh.$mm'; // e.g., 2025-09-13 • 14.05
+}
+
+bool _wasEdited(Map<String, dynamic> m) {
+  final c = m['created_at'] ?? m['createdAt'] ?? m['createdAtUtc'];
+  final u = m['updated_at'] ?? m['updatedAt'];
+  if (c == null || u == null) return false;
+  try {
+    final cd = (c is int) ? DateTime.fromMillisecondsSinceEpoch(c) : DateTime.parse('$c');
+    final ud = (u is int) ? DateTime.fromMillisecondsSinceEpoch(u) : DateTime.parse('$u');
+    return ud.isAfter(cd.add(const Duration(seconds: 1)));
+  } catch (_) {
+    return false;
+  }
+}
+class _ActionBtn extends StatelessWidget {
+  final IconData icon;
+  final String Function(_FeedPostState) labelBuilder;
+  const _ActionBtn({required this.icon, required this.labelBuilder});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = context.findAncestorStateOfType<_FeedPostState>()!;
+    return InkWell(
+      onTap: () {
+        if (icon == Icons.thumb_up_alt_outlined) {
+          s._likePost(context);
+        } else if (icon == Icons.mode_comment_outlined) {
+          s._commentOnPost(context);
+        } else if (icon == Icons.repeat_outlined) {
+          s._toggleReshare(context);
+        } else {
+          // no-op
+        }
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 18),
+            const SizedBox(width: 6),
+            Flexible(child: Text(labelBuilder(s), maxLines: 1, overflow: TextOverflow.ellipsis)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+class _SummaryBlock extends StatelessWidget {
+  final String text;
+  final String? thumbUrl;
+  const _SummaryBlock({required this.text, this.thumbUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      decoration: BoxDecoration(
+        color: cs.surfaceVariant.withOpacity(.28),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.outlineVariant.withOpacity(.8)),
+      ),
+      padding: const EdgeInsets.all(10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if ((thumbUrl ?? '').isNotEmpty) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Image.network(
+                thumbUrl!,
+                width: 64, height: 64, fit: BoxFit.cover,
+                errorBuilder: (_, __, ___) => Container(
+                  width: 64, height: 64, color: cs.surface, alignment: Alignment.center,
+                  child: const Icon(Icons.image_not_supported_outlined, size: 18),
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+          ],
+          Expanded(
+            child: Text(
+              text,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(height: 1.25, color: cs.onSurface),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+class WeeklyTopFindsTab extends StatefulWidget {
+  final void Function(int userId) onAvatarTap;
+  final bool isActive;
+
+
+  final int? currentUserId;
+  final bool currentUserIsAdmin;
+
+  const WeeklyTopFindsTab({
+    super.key,
+    required this.onAvatarTap,
+    required this.isActive,
+    this.currentUserId,                
+    this.currentUserIsAdmin = false,    
+  });
+
+  @override
+  State<WeeklyTopFindsTab> createState() => _WeeklyTopFindsTabState();
+}
+class _WeeklyTopFindsTabState extends State<WeeklyTopFindsTab> {
+  List<Map<String, dynamic>> posts = [];
+  bool _loading = false;
+  int? currentUserId;
+  bool isAdmin = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchTopFinds();
+  }
+
+  @override
+  void didUpdateWidget(covariant WeeklyTopFindsTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!oldWidget.isActive && widget.isActive && posts.isEmpty) {
+      _fetchTopFinds();
+    }
+  }
+
+  Future<void> _fetchTopFinds() async {
+    if (_loading) return;
+    setState(() => _loading = true);
+    try {
+      final headers = await AuthService.authHeaders;
+      final res = await http.get(
+        Uri.parse('https://anime-seek.com/fastapi/feed/global'),
+        headers: headers,
+      );
+      if (!mounted) return;
+      if (res.statusCode == 200) {
+        final data = jsonDecode(utf8.decode(res.bodyBytes));
+        final all = (data is List) ? data.cast<Map<String, dynamic>>() : <Map<String, dynamic>>[];
+        final tf = all.where(isWeeklyTopFindPost).toList();
+        setState(() => posts = tf);
+        debugPrint('Weekly Top Finds loaded: ${posts.length}');
+      } else {
+        debugPrint('TopFind fetch failed: ${res.statusCode} ${res.body}');
+      }
+    } catch (e) {
+      debugPrint('TopFind fetch error: $e');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return RefreshIndicator(
+      onRefresh: _fetchTopFinds,
+      displacement: 24,
+      child: _loading && posts.isEmpty
+          ? ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 160),
+          Center(child: CircularProgressIndicator()),
+        ],
+      )
+          : (posts.isEmpty
+          ? ListView(
+        physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        children: [
+          const SizedBox(height: 24),
+          Center(
+            child: Text('No Top Finds yet this week.', style: TextStyle(color: cs.onSurfaceVariant)),
+          ),
+        ],
+      )
+          : ListView.builder(
+        physics: const AlwaysScrollableScrollPhysics(parent: BouncingScrollPhysics()),
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        itemCount: posts.length,
+        itemBuilder: (context, index) {
+          final p = posts[index];
+          final u = (p['user'] as Map?)?.cast<String, dynamic>() ?? const {};
+          int _asInt(dynamic v) => (v is num) ? v.toInt() : int.tryParse('$v') ?? 0;
+          String _asStr(dynamic v) => v == null ? '' : v.toString();
+
+          final postId    = _asInt(p['id']);
+          final userId    = _asInt(u['id']);
+          final username  = _asStr(u['display_name']).isEmpty ? 'Unknown' : _asStr(u['display_name']);
+          final avatarUrl = _asStr(u['avatar_url']);
+
+          final content      = _pickStr(p, ['text','content','body','message']);
+          final imagePreview = _asStr(p['image_preview_url'] ?? p['thumbnail_url'] ?? p['thumbnail']);
+          final imageUrl     = _asStr(p['image_url'] ?? p['image']);
+          final videoUrl     = _asStr(p['video_url'] ?? p['gif_mp4_url'] ?? p['video']);
+
+          final likeCount    = (p['like_count'] as num?)?.toInt() ?? 0;
+          final commentCount = (p['comment_count'] as num?)?.toInt() ?? 0;
+          final likedByMe    = p['liked_by_me'] == true;
+          final reshareCount = (p['reshare_count'] as num?)?.toInt() ?? 0;
+          final resharedByMe = p['reshared_by_me'] == true;
+          final bgHex        = _asStr(p['background_color'] ?? p['bg_color'] ?? p['bgColor']);
+
+          final poll = parsePoll(p);
+          final hasImage = imagePreview.isNotEmpty || imageUrl.isNotEmpty;
+          final displaySnippet = content.isNotEmpty
+              ? content
+              : (poll.isPoll
+              ? (poll.question.isNotEmpty ? '📊 ${poll.question}' : '📊 Poll')
+              : (hasImage ? '(image)' : '…'));
+
+          return FeedPost(
+            key: ValueKey<int>(postId),
+            postId: postId,
+            userId: userId,
+            currentUserId: null, // not needed for this list’s actions
+            username: username,
+            avatarUrl: avatarUrl,
+            currentUserIsAdmin: widget.currentUserIsAdmin,
+            content: displaySnippet,
+            imageUrl: imageUrl.isEmpty ? null : imageUrl,
+            imagePreviewUrl: imagePreview.isEmpty ? null : imagePreview,
+            videoUrl: videoUrl.isEmpty ? null : videoUrl,
+            onAvatarTap: widget.onAvatarTap,
+            heroPrefix: 'TopFind',
+            likeCount: likeCount,
+            commentCount: commentCount,
+            likedByMe: likedByMe,
+            backgroundColor: bgHex.isEmpty ? null : bgHex,
+            reshareCount: reshareCount,
+            resharedByMe: resharedByMe,
+            isPoll: poll.isPoll,
+            poll: poll,
+            onOpenProfile: () => widget.onAvatarTap(userId),
+          );
+        },
+      )),
+    );
+  }
+}

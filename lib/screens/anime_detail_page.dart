@@ -8,7 +8,15 @@ import 'package:anime_finder/screens/search_page.dart';
 
 class AnimeDetailPage extends StatefulWidget {
   final int id;
-  const AnimeDetailPage({Key? key, required this.id}) : super(key: key);
+  final String? currentTier;
+  final int? remainingSearches;
+
+  const AnimeDetailPage({
+    Key? key,
+    required this.id,
+    this.currentTier,
+    this.remainingSearches,
+  }) : super(key: key);
 
   @override
   _AnimeDetailPageState createState() => _AnimeDetailPageState();
@@ -239,16 +247,39 @@ query($id: Int) {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Center(
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(12),
-              child: Image.network(
-                _anime!['coverImage']['large'] as String,
-                height: 240,
-                fit: BoxFit.cover,
+          if (widget.currentTier != null && widget.remainingSearches != null)
+            Card(
+              color: Colors.grey[100],
+              margin: const EdgeInsets.only(bottom: 12),
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 8,
+                      runSpacing: 4,
+                      children: [
+                        Text('Tier:', style: TextStyle(fontWeight: FontWeight.bold)),
+                        Text('${widget.currentTier}'),
+                        Text('|'),
+                        Text('Searches left:', style: TextStyle(fontWeight: FontWeight.bold)),
+                        Text('${widget.remainingSearches}'),
+                      ],
+                    ),
+                    if (widget.remainingSearches == 0) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Please upgrade for a higher limit!',
+                        style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                  ],
+                ),
               ),
             ),
-          ),
           const SizedBox(height: 12),
           Text(
             _anime!['title']['english'] ?? _anime!['title']['romaji'],
@@ -328,7 +359,11 @@ query($id: Int) {
         final s = _similar[i];
         return GestureDetector(
           onTap: () => Navigator.of(context).push(
-            MaterialPageRoute(builder: (_) => AnimeDetailPage(id: s.id)),
+            MaterialPageRoute(
+              builder: (_) => AnimeDetailPage(
+                id: s.id, // s is SimilarAnime
+              ),
+            ),
           ),
           child: Container(
             width: 140,

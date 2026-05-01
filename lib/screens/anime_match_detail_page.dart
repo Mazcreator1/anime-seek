@@ -18,7 +18,14 @@ import 'package:anime_finder/screens/discord_page.dart';
 
 class AnimeMatchDetailPage extends StatefulWidget {
   final Map<String, dynamic> anime;
-  const AnimeMatchDetailPage({Key? key, required this.anime}) : super(key: key);
+  final String? currentTier;
+  final int? remainingSearches;
+  const AnimeMatchDetailPage({
+    Key? key,
+    required this.anime,
+    this.currentTier,
+    this.remainingSearches,
+  }) : super(key: key);
 
   @override
   _AnimeMatchDetailPageState createState() => _AnimeMatchDetailPageState();
@@ -248,6 +255,33 @@ class _AnimeMatchDetailPageState extends State<AnimeMatchDetailPage> {
                     onPressed: () => _launch(videoUrl),
                   ),
               ]),
+              if (widget.currentTier != null && widget.remainingSearches != null) ...[
+                Card(
+                  color: Colors.grey[100],
+                  margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+                  child: Padding(
+                    padding: const EdgeInsets.all(12.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Text(
+                          'Tier: ${widget.currentTier}   |   Searches left: ${widget.remainingSearches}',
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        if (widget.remainingSearches == 0) ...[
+                          const SizedBox(height: 8),
+                          const Text(
+                            'Please upgrade for a higher limit!',
+                            style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                            textAlign: TextAlign.center,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 24),
               const SizedBox(height: 16),
               const Center(

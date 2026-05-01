@@ -4,7 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Tracks both matched‑song favorites and AniList anime favorites by ID,
+/// Tracks both matched-song favorites and AniList anime favorites by ID,
 /// with local persistence across app restarts.
 class FavoritesModel extends ChangeNotifier {
   FavoritesModel() {
@@ -14,19 +14,51 @@ class FavoritesModel extends ChangeNotifier {
   // --- SONG favorites storage ---
   final List<Map<String, dynamic>> _songFavorites = [];
 
-  /// Read‑only view of your song favorites.
-  List<Map<String, dynamic>> get songFavoritesList => List.unmodifiable(_songFavorites);
+  /// Read-only view of your song favorites.
+  List<Map<String, dynamic>> get songFavoritesList =>
+      List.unmodifiable(_songFavorites);
 
-  /// True if the Map song is favorited.
-  bool isSongFavorite(Map<String, dynamic> item) => _songFavorites.contains(item);
+  /// Stable key for a song favorite: "<song_name>::<anime_id?>"
+  String _songKeyOf(Map<String, dynamic> item) {
+    final songName = (item['song_name'] ?? '').toString();
+    final anime = (item['anime'] as Map<String, dynamic>?) ?? const {};
+    final dynamic rawId = anime['id'];
+    final animeId = rawId == null ? '' : rawId.toString();
+    return '$songName::$animeId';
+  }
 
-  /// Toggles a song favorite on/off.
-  void toggleFavorite(Map<String, dynamic> item) {
-    if (_songFavorites.contains(item)) {
-      _songFavorites.remove(item);
+  /// Returns true if a song (by stable key) is already favorited.
+  bool isSongFavorite(Map<String, dynamic> item) {
+    final key = _songKeyOf(item);
+    return _songFavorites.any((m) => _songKeyOf(m) == key);
+  }
+
+  /// Returns true if (songName + animeId) is already favorited.
+  bool isSongFavoriteByKey(String songName, String? animeId) {
+    final want = '${songName}::${animeId ?? ''}';
+    return _songFavorites.any((m) => _songKeyOf(m) == want);
+  }
+
+  /// Toggle a song favorite on/off (by stable key).
+  void toggleSongFavorite(Map<String, dynamic> item) {
+    final key = _songKeyOf(item);
+    final idx = _songFavorites.indexWhere((m) => _songKeyOf(m) == key);
+    if (idx >= 0) {
+      _songFavorites.removeAt(idx);
     } else {
       _songFavorites.add(item);
     }
+    _saveSongPrefs();
+    notifyListeners();
+  }
+
+  /// Backward-compat: calls toggleSongFavorite.
+  void toggleFavorite(Map<String, dynamic> item) => toggleSongFavorite(item);
+
+  /// Remove a song by key parts.
+  void removeSongByKey(String songName, String? animeId) {
+    final want = '${songName}::${animeId ?? ''}';
+    _songFavorites.removeWhere((m) => _songKeyOf(m) == want);
     _saveSongPrefs();
     notifyListeners();
   }
@@ -41,7 +73,7 @@ class FavoritesModel extends ChangeNotifier {
   // --- ANIME favorites storage by ID only ---
   final List<String> _animeFavoriteIds = [];
 
-  /// Read‑only view of your AniList anime favorite IDs.
+  /// Read-only view of your AniList anime favorite IDs.
   List<String> get animeFavoritesList => List.unmodifiable(_animeFavoriteIds);
 
   /// True if the given anime id is favorited.
@@ -78,33 +110,54 @@ class FavoritesModel extends ChangeNotifier {
 
   Future<void> _loadFromPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    // load songs
+
+    // Load songs + dedupe by stable key
     final songJson = prefs.getString(_songKey);
     if (songJson != null) {
       try {
         final List decoded = jsonDecode(songJson);
+        final List<Map<String, dynamic>> loaded =
+        decoded.cast<Map<String, dynamic>>();
+        final seen = <String>{};
         _songFavorites
           ..clear()
-          ..addAll(decoded.cast<Map<String, dynamic>>());
-      } catch (_) {}
+          ..addAll(loaded.where((m) {
+            final k = _songKeyOf(m);
+            if (seen.contains(k)) return false;
+            seen.add(k);
+            return true;
+          }));
+      } catch (_) {
+        // ignore corrupt data
+      }
     }
-    // load anime IDs
+
+    // Load anime IDs + dedupe
     final List<String>? animeList = prefs.getStringList(_animeKey);
     if (animeList != null) {
+      final deduped = animeList.toSet().toList();
       _animeFavoriteIds
         ..clear()
-        ..addAll(animeList);
+        ..addAll(deduped);
     }
+
     notifyListeners();
   }
 
   Future<void> _saveSongPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    prefs.setString(_songKey, jsonEncode(_songFavorites));
+    // Deduplicate before saving (defensive)
+    final seen = <String>{};
+    final deduped = <Map<String, dynamic>>[];
+    for (final m in _songFavorites) {
+      final k = _songKeyOf(m);
+      if (seen.add(k)) deduped.add(m);
+    }
+    prefs.setString(_songKey, jsonEncode(deduped));
   }
 
   Future<void> _saveAnimePrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    prefs.setStringList(_animeKey, _animeFavoriteIds);
+    prefs.setStringList(_animeKey, _animeFavoriteIds.toSet().toList());
   }
 }

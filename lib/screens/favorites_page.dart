@@ -7,8 +7,8 @@ import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:collection/collection.dart';
 
+import '../utils/share_to_feed.dart';
 import 'package:anime_finder/models/favorites_model.dart';
 import 'package:anime_finder/models/playlist_model.dart';
 import 'package:anime_finder/screens/anime_match_detail_page.dart';
@@ -46,13 +46,19 @@ class _FavoritesPageState extends State<FavoritesPage>
     _tabController = TabController(length: 2, vsync: this)
       ..addListener(() {
         if (mounted) _loadSelectedPlaylist();
+
+        // If switching to the Animes tab, make sure we have details
+        if (_tabController.index == 1) {
+          final ids = context.read<FavoritesModel>().animeFavoritesList;
+          _fetchAnimeDetails(ids);
+        }
       });
+
     _searchController.addListener(() {
-      if (mounted) {
-        setState(() {
-          _searchQuery = _searchController.text.trim().toLowerCase();
-        });
-      }
+      if (!mounted) return;
+      setState(() {
+        _searchQuery = _searchController.text.trim().toLowerCase();
+      });
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -142,21 +148,28 @@ class _FavoritesPageState extends State<FavoritesPage>
     final favModel = context.watch<FavoritesModel>();
     final playlistsModel = context.watch<PlaylistsModel>();
 
-    // Filter favorites by search query
-    final songFaves = favModel.songFavoritesList.where((m) {
+    // Build the base song list depending on playlist selection,
+    // then apply the search filter so search works in both modes.
+    final List<Map<String, dynamic>> baseSongs =
+    _selectedSongPlaylist == null
+        ? favModel.songFavoritesList
+        : playlistsModel.getSongsInPlaylist(_selectedSongPlaylist!);
+
+    List<Map<String, dynamic>> filteredSongs = baseSongs.where((m) {
       final song = (m['song_name'] as String? ?? '').toLowerCase();
       final title = (m['anime']?['title'] as String? ?? '').toLowerCase();
-      return song.contains(_searchQuery) || title.contains(_searchQuery);
+      return _searchQuery.isEmpty ||
+          song.contains(_searchQuery) ||
+          title.contains(_searchQuery);
     }).toList();
+
+    // Anime favorites: apply search first
     final animeIds = favModel.animeFavoritesList
         .where((id) => id.toLowerCase().contains(_searchQuery))
         .toList();
 
-    // Apply playlist filtering
-    final filteredSongs = _selectedSongPlaylist == null
-        ? songFaves
-        : playlistsModel.getSongsInPlaylist(_selectedSongPlaylist!);
-    final filteredAnimes = _selectedAnimePlaylist == null
+    // If a playlist is selected for Animes, intersect with that playlist
+    final List<String> filteredAnimes = _selectedAnimePlaylist == null
         ? animeIds
         : playlistsModel
         .getAnimesInPlaylist(_selectedAnimePlaylist!)
@@ -189,7 +202,7 @@ class _FavoritesPageState extends State<FavoritesPage>
           IconButton(
             icon: const Icon(Icons.playlist_add),
             tooltip: 'New Playlist',
-            onPressed: (isSongsTab ? songFaves.isNotEmpty : animeIds.isNotEmpty)
+            onPressed: (isSongsTab ? filteredSongs.isNotEmpty : filteredAnimes.isNotEmpty)
                 ? _onCreatePlaylist
                 : null,
           ),
@@ -342,15 +355,13 @@ class _FavoritesPageState extends State<FavoritesPage>
                         color: Colors.red,
                         alignment: Alignment.centerRight,
                         padding: const EdgeInsets.only(right: 20),
-                        child:
-                        const Icon(Icons.delete, color: Colors.white),
+                        child: const Icon(Icons.delete, color: Colors.white),
                       ),
                       onDismissed: (_) {
                         setState(() {
                           if (_selectedSongPlaylist == null) {
-                            context
-                                .read<FavoritesModel>()
-                                .toggleFavorite(m);
+                            // Use the new FavoritesModel API
+                            context.read<FavoritesModel>().toggleSongFavorite(m);
                           } else {
                             playlistsModel.removeSongFromPlaylist(
                               _selectedSongPlaylist!,
@@ -380,8 +391,7 @@ class _FavoritesPageState extends State<FavoritesPage>
                   itemCount: filteredAnimes.length,
                   itemBuilder: (_, i) {
                     final id = filteredAnimes[i];
-                    final title =
-                        _animeDetails[id]?.title ?? 'Anime #$id';
+                    final title = _animeDetails[id]?.title ?? 'Anime #$id';
                     return Dismissible(
                       key: ValueKey(id),
                       direction: DismissDirection.endToStart,
@@ -389,12 +399,12 @@ class _FavoritesPageState extends State<FavoritesPage>
                         color: Colors.red,
                         alignment: Alignment.centerRight,
                         padding: const EdgeInsets.only(right: 20),
-                        child:
-                        const Icon(Icons.delete, color: Colors.white),
+                        child: const Icon(Icons.delete, color: Colors.white),
                       ),
                       onDismissed: (_) {
                         setState(() {
                           if (_selectedAnimePlaylist == null) {
+                            // Keep using your existing anime toggler if present
                             context
                                 .read<FavoritesModel>()
                                 .toggleAnimeFavoriteById(id);
@@ -456,8 +466,11 @@ class _FavoritesPageState extends State<FavoritesPage>
           : await model.createAnimePlaylist(name, items);
       if (success) {
         setState(() {
-          if (isSongsTab) _selectedSongPlaylist = name;
-          else _selectedAnimePlaylist = name;
+          if (isSongsTab) {
+            _selectedSongPlaylist = name;
+          } else {
+            _selectedAnimePlaylist = name;
+          }
         });
         await _saveSelectedPlaylist(name);
       } else {
@@ -517,38 +530,79 @@ class _FavoritesPageState extends State<FavoritesPage>
   Widget songTile(Map<String, dynamic> m) {
     final title = m['song_name'] as String? ?? '';
     final ani = m['anime'] as Map<String, dynamic>? ?? {};
+    final coverUrl = ani['cover_url'] as String?;
+    final animeTitle = (ani['title'] as String?) ?? '';
+    final animeIdAny = ani['id'];
+    final anilistId = animeIdAny is int
+        ? animeIdAny
+        : (animeIdAny is String ? int.tryParse(animeIdAny) : null);
+
     return ListTile(
-      leading: ani['cover_url'] != null
-          ? Image.network(ani['cover_url'], width: 50, fit: BoxFit.cover)
+      leading: (coverUrl != null && coverUrl.isNotEmpty)
+          ? Image.network(coverUrl, width: 50, fit: BoxFit.cover)
           : const Icon(Icons.music_note),
       title: Text(title),
-      subtitle: Text(ani['title'] ?? ''),
+      subtitle: Text(animeTitle),
       onTap: () => Navigator.push(
         context,
         MaterialPageRoute(builder: (_) => AnimeMatchDetailPage(anime: m)),
       ),
-      trailing: _selectedPlaylist != null
-          ? IconButton(
-        icon: const Icon(Icons.delete),
-        onPressed: () {
-          setState(() {
-            context
-                .read<PlaylistsModel>()
-                .removeSongFromPlaylist(_selectedPlaylist!, m);
-          });
-        },
-      )
-          : null,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: 'Share to Feed',
+            icon: const Icon(Icons.send),
+            onPressed: () {
+              final artist = m['artist'] as String?;
+              final typ = m['op_ed_type'] as String?;
+              final caption = StringBuffer('🎵 $title');
+              if (artist != null && artist.isNotEmpty) caption.write(' • $artist');
+              if (typ != null && typ.isNotEmpty) caption.write(' • $typ');
+              if (animeTitle.isNotEmpty) caption.write(' — $animeTitle');
+
+              shareToFeed(
+                context: context,
+                caption: caption.toString(),
+                imageUrl: coverUrl,
+                anilistId: anilistId,
+                animeTitle: animeTitle,
+                extra: {
+                  "source": "Favorites-Songs",
+                  "song_name": title,
+                  "artist": artist,
+                  "op_ed_type": typ,
+                },
+              );
+            },
+          ),
+          if (_selectedPlaylist != null)
+            IconButton(
+              icon: const Icon(Icons.delete),
+              onPressed: () {
+                setState(() {
+                  context
+                      .read<PlaylistsModel>()
+                      .removeSongFromPlaylist(_selectedPlaylist!, m);
+                });
+              },
+            ),
+        ],
+      ),
     );
   }
 
   Widget animeTile(String id) {
     final a = _animeDetails[id];
+    final coverUrl = a?.coverUrl;
+    final title = a?.title ?? 'Anime #$id';
+    final anilistId = a?.id;
+
     return ListTile(
-      leading: a?.coverUrl != null
-          ? Image.network(a!.coverUrl, width: 50, fit: BoxFit.cover)
+      leading: (coverUrl != null && coverUrl.isNotEmpty)
+          ? Image.network(coverUrl, width: 50, fit: BoxFit.cover)
           : const Icon(Icons.movie),
-      title: Text(a?.title ?? 'Anime #$id'),
+      title: Text(title),
       subtitle: Text(a?.genres.join(', ') ?? ''),
       onTap: () {
         if (a != null) {
@@ -558,18 +612,39 @@ class _FavoritesPageState extends State<FavoritesPage>
           );
         }
       },
-      trailing: _selectedPlaylist != null
-          ? IconButton(
-        icon: const Icon(Icons.delete),
-        onPressed: () {
-          setState(() {
-            context
-                .read<PlaylistsModel>()
-                .removeAnimeFromPlaylist(_selectedPlaylist!, id);
-          });
-        },
-      )
-          : null,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            tooltip: 'Share to Feed',
+            icon: const Icon(Icons.send),
+            onPressed: () {
+              shareToFeed(
+                context: context,
+                caption: "⭐ $title",
+                imageUrl: coverUrl,
+                anilistId: anilistId,
+                animeTitle: title,
+                extra: {
+                  "source": "Favorites-Animes",
+                  "genres": a?.genres,
+                },
+              );
+            },
+          ),
+          if (_selectedPlaylist != null)
+            IconButton(
+              icon: const Icon(Icons.delete),
+              onPressed: () {
+                setState(() {
+                  context
+                      .read<PlaylistsModel>()
+                      .removeAnimeFromPlaylist(_selectedPlaylist!, id);
+                });
+              },
+            ),
+        ],
+      ),
     );
   }
 }

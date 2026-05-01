@@ -5,7 +5,7 @@ import 'package:url_launcher/url_launcher.dart';
 class DiscordPage extends StatelessWidget {
   const DiscordPage({Key? key}) : super(key: key);
 
-  static const _inviteUrl = 'https://discord.gg/your‑invite‑code';
+  static const _inviteUrl = 'https://discord.gg/RhVnBDUC94';
 
   Future<void> _joinDiscord() async {
     final uri = Uri.parse(_inviteUrl);

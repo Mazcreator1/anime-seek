@@ -1,16 +1,27 @@
-// lib/screens/swipe_tab_page.dart
-
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'package:anime_finder/screens/history_page.dart';
-import 'package:anime_finder/screens/favorites_page.dart';
-// 👇 Make sure this matches the actual file name where DiscoverPage lives
-import 'package:anime_finder/screens/Discover_Page.dart';
-import 'package:anime_finder/screens/analytics_page.dart';
-import 'package:anime_finder/screens/discord_page.dart';
-import 'package:anime_finder/screens/trace_Search_page.dart';
-import 'package:anime_finder/screens/subscription_screen.dart';
-import 'package:anime_finder/screens/signup.dart';
+import 'package:http/http.dart' as http;
+
+import 'package:anime_finder/services/api_service.dart';
+import 'package:anime_finder/services/auth_service.dart';
+import 'package:anime_finder/models/analytics_model.dart';
+
+// Core app pages
+import 'feed_page.dart';
+import 'Discover_Page.dart';
+import 'history_page.dart';
+import 'favorites_page.dart';
+import 'analytics_page.dart';
+import 'discord_page.dart';
+import 'my_account_page.dart';
+import 'profile_page.dart';
+import 'discover_profiles_page.dart';
+import 'character_creator_page.dart';
+
+import 'package:anime_finder/screens/settings_page.dart';
+
+// import 'package:anime_finder/screens/markets/markets_list_page.dart';
 
 class SwipeTabPage extends StatefulWidget {
   const SwipeTabPage({Key? key}) : super(key: key);
@@ -19,13 +30,62 @@ class SwipeTabPage extends StatefulWidget {
   State<SwipeTabPage> createState() => _SwipeTabPageState();
 }
 
-class _SwipeTabPageState extends State<SwipeTabPage> with TickerProviderStateMixin {
+class _SwipeTabPageState extends State<SwipeTabPage>
+    with TickerProviderStateMixin {
   late final TabController _tabController;
+
+  late final List<Tab> _tabs = <Tab>[
+    const Tab(text: 'Feed'),
+    const Tab(text: 'Profile'),
+    const Tab(text: 'Discover Profiles'),
+    const Tab(text: 'History'),
+    const Tab(text: 'Favorites'),
+    const Tab(text: 'Discover Anime'),
+
+    const Tab(text: 'Character Creator'),
+    const Tab(text: 'Analytics'),
+    const Tab(text: 'Discord'),
+    const Tab(text: 'Account'),
+    const Tab(text: 'Settings'),
+  ];
+
+  late final List<Widget> _pages = <Widget>[
+    const FeedPage(),
+
+    FutureBuilder<http.Response>(
+      future: AuthService.me(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snapshot.hasError || snapshot.data?.statusCode != 200) {
+          return const Center(child: Text('Failed to load profile.'));
+        }
+        final data = jsonDecode(snapshot.data!.body) as Map<String, dynamic>;
+        final id = (data['id'] as num?)?.toInt() ?? 0;
+        return ProfilePage(userId: id);
+      },
+    ),
+
+    const DiscoverProfilesPage(),
+    const HistoryPage(),
+    const FavoritesPage(),
+    const DiscoverPage(),
+   
+    const CharacterCreatorPage(),
+    ChangeNotifierProvider<AnalyticsModel>(
+      create: (_) => AnalyticsModel(),
+      child: const AnalyticsPage(),
+    ),
+    const DiscordPage(),
+    const MyAccountPage(),
+    SettingsPage(),
+  ];
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 6, vsync: this);
+    _tabController = TabController(length: _tabs.length, vsync: this);
   }
 
   @override
@@ -34,33 +94,24 @@ class _SwipeTabPageState extends State<SwipeTabPage> with TickerProviderStateMix
     super.dispose();
   }
 
+  PreferredSizeWidget _buildAppBar() {
+    return AppBar(
+      title: const Text('Library'),
+      bottom: TabBar(
+        controller: _tabController,
+        isScrollable: true,
+        tabs: _tabs,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Library'),
-        bottom: TabBar(
-          controller: _tabController,
-          tabs: const [
-            Tab(icon: Icon(Icons.history), text: 'History'),
-            Tab(icon: Icon(Icons.star), text: 'Favorites'),
-            Tab(icon: Icon(Icons.explore), text: 'Discover'),
-            Tab(icon: Icon(Icons.analytics), text: 'Analytics'),
-            Tab(icon: Icon(Icons.chat), text: 'Discord'),
-            Tab(icon: Icon(Icons.search), text: 'TraceAnime'),
-          ],
-        ),
-      ),
+      appBar: _buildAppBar(),
       body: TabBarView(
         controller: _tabController,
-        children: [
-          HistoryPage(),
-          FavoritesPage(),
-          DiscoverPage(),
-          AnalyticsPage(),
-          DiscordPage(),
-          TraceSearchPage(),
-        ],
+        children: _pages,
       ),
     );
   }

@@ -43,6 +43,20 @@
 		</array>
 		<key>CADisableMinimumFrameDurationOnPhone</key>
 		<true/>
+		<key>CFBundleURLTypes</key>
+		<array>
+			<string>anime-seek</string>
+			<dict>
+				<key>CFBundleURLSchemes</key>
+				<array>
+					<string>https</string>
+				</array>
+			</dict>
+		</array>
+		<key>NSUserActivityTypes</key>
+		<array>
+			<string>NSUserActivityTypeBrowsingWeb</string>
+		</array>
 		<key>UIApplicationSupportsIndirectInputEvents</key>
 		<true/>
 		<key>UIStatusBarHidden</key>

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:anime_finder/screens/anime_detail_page.dart';
+import 'dart:io';
 
 /// SearchPage now supports initial genre/tag filters for deep-linking.
 class SearchPage extends StatefulWidget {
@@ -41,16 +42,35 @@ class _SearchPageState extends State<SearchPage> {
 
     // Load filter options, then apply any initial filters and run search
     _fetchFilterOptions().then((_) {
-      if (widget.initialGenreFilter != null && _allGenres.contains(widget.initialGenreFilter)) {
+      if (widget.initialGenreFilter != null &&
+          _allGenres.contains(widget.initialGenreFilter)) {
         _selectedGenres.add(widget.initialGenreFilter!);
       }
-      if (widget.initialTagFilter != null && _allTags.contains(widget.initialTagFilter)) {
+      if (widget.initialTagFilter != null &&
+          _allTags.contains(widget.initialTagFilter)) {
         _selectedTags.add(widget.initialTagFilter!);
       }
       // perform initial search with filters
       _performSearch();
     });
   }
+
+  void _onSearchPressed() async {
+    FocusScope.of(context).unfocus();
+    await _performSearch();
+  }
+
+  void _onClearPressed() {
+    setState(() {
+      _searchController.clear();
+      _selectedGenres.clear();
+      _selectedTags.clear();
+      _results.clear();
+    });
+    // Optionally re-run an empty search:
+    // _performSearch();
+  }
+
 
   /// Fetches all genres and a sampling of tags for filter chips
   Future<void> _fetchFilterOptions() async {
@@ -63,7 +83,8 @@ class _SearchPageState extends State<SearchPage> {
     );
     if (gResp.statusCode == 200) {
       final data = json.decode(gResp.body)['data']['GenreCollection'] as List;
-      _allGenres = List<String>.from(data)..sort();
+      _allGenres = List<String>.from(data)
+        ..sort();
     }
 
     // Get tags from a sample of anime
@@ -86,7 +107,8 @@ query {
           tags.add(t['name'] as String);
         }
       }
-      _allTags = tags.toList()..sort();
+      _allTags = tags.toList()
+        ..sort();
     }
 
     setState(() {});
@@ -164,24 +186,30 @@ query(\$search:String, \$page:Int, \$perPage:Int) {
       body: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Search input
+          // Search actions (fixed: finite width inside Row)
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: Row(
               children: [
                 Expanded(
-                  child: TextField(
-                    controller: _searchController,
-                    decoration: const InputDecoration(
-                      hintText: 'Search by title...',
-                      prefixIcon: Icon(Icons.search),
-                      border: OutlineInputBorder(),
+                  child: SizedBox(
+                    height: 44,
+                    child: ElevatedButton(
+                      onPressed: _onSearchPressed,
+                      child: const Text('Search'),
                     ),
-                    onSubmitted: (_) => _performSearch(),
                   ),
                 ),
                 const SizedBox(width: 8),
-                ElevatedButton(onPressed: _performSearch, child: const Text('Search')),
+                Expanded(
+                  child: SizedBox(
+                    height: 44,
+                    child: OutlinedButton(
+                      onPressed: _onClearPressed,
+                      child: const Text('Clear'),
+                    ),
+                  ),
+                ),
               ],
             ),
           ),
@@ -190,25 +218,28 @@ query(\$search:String, \$page:Int, \$perPage:Int) {
           if (_allGenres.isNotEmpty) ...[
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: Text('Filter by Genre', style: TextStyle(fontWeight: FontWeight.bold)),
+              child: Text('Filter by Genre',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
             ),
             SizedBox(
               height: 40,
               child: ListView(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                children: _allGenres.map((g) => Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: FilterChip(
-                    label: Text(g),
-                    selected: _selectedGenres.contains(g),
-                    onSelected: (sel) {
-                      setState(() {
-                        sel ? _selectedGenres.add(g) : _selectedGenres.remove(g);
-                      });
-                    },
-                  ),
-                )).toList(),
+                children: _allGenres.map((g) =>
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: Text(g),
+                        selected: _selectedGenres.contains(g),
+                        onSelected: (sel) {
+                          setState(() {
+                            sel ? _selectedGenres.add(g) : _selectedGenres
+                                .remove(g);
+                          });
+                        },
+                      ),
+                    )).toList(),
               ),
             ),
           ],
@@ -217,25 +248,28 @@ query(\$search:String, \$page:Int, \$perPage:Int) {
           if (_allTags.isNotEmpty) ...[
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-              child: Text('Filter by Tag', style: TextStyle(fontWeight: FontWeight.bold)),
+              child: Text('Filter by Tag',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
             ),
             SizedBox(
               height: 40,
               child: ListView(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 8),
-                children: _allTags.map((t) => Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: FilterChip(
-                    label: Text(t),
-                    selected: _selectedTags.contains(t),
-                    onSelected: (sel) {
-                      setState(() {
-                        sel ? _selectedTags.add(t) : _selectedTags.remove(t);
-                      });
-                    },
-                  ),
-                )).toList(),
+                children: _allTags.map((t) =>
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        label: Text(t),
+                        selected: _selectedTags.contains(t),
+                        onSelected: (sel) {
+                          setState(() {
+                            sel ? _selectedTags.add(t) : _selectedTags.remove(
+                                t);
+                          });
+                        },
+                      ),
+                    )).toList(),
               ),
             ),
           ],
@@ -261,11 +295,12 @@ query(\$search:String, \$page:Int, \$perPage:Int) {
                     overflow: TextOverflow.ellipsis,
                   ),
                   isThreeLine: true,
-                  onTap: () => Navigator.of(context).push(
-                    MaterialPageRoute(
-                      builder: (_) => AnimeDetailPage(id: a.id),
-                    ),
-                  ),
+                  onTap: () =>
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => AnimeDetailPage(id: a.id),
+                        ),
+                      ),
                 );
               },
             ),
@@ -276,7 +311,7 @@ query(\$search:String, \$page:Int, \$perPage:Int) {
   }
 }
 
-/// Internal model for search results (includes both genres & tags)
+  /// Internal model for search results (includes both genres & tags)
 class _Anime {
   final int id;
   final String title;
