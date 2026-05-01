@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs><style>.ring{fill:none;stroke:#14b8a6;stroke-width:120;}</style></defs>
+  <circle class="ring" cx="512.0" cy="512.0" r="392.0"/>
+  <circle cx="512.0" cy="512.0" r="210" fill="#fff"/>
+  <line x1="659.0" y1="659.0" x2="919.0" y2="919.0" stroke="#fff" stroke-width="140" stroke-linecap="round"/>
+</svg>

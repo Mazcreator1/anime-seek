@@ -1,0 +1,404 @@
+// src/search.js
+import crypto from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import child_process from "node:child_process";
+import fs from "node:fs/promises";
+import aniep from "aniep";
+import sharp from "sharp";
+import { performance } from "node:perf_hooks";            // ← updated import
+import getSolrCoreList from "./lib/get-solr-core-list.js";
+
+const {
+  TRACE_API_SALT,
+  TRACE_ACCURACY = 1,
+  SEARCH_QUEUE = Infinity,
+  USE_IMAGE_PROXY = false,
+} = process.env;
+
+const search = (image, candidates, anilistID) =>
+  Promise.all(
+    getSolrCoreList().map((coreURL) =>
+      fetch(
+        `${coreURL}/lireq?${[
+          "field=cl_ha",
+          "ms=false",
+          `accuracy=${TRACE_ACCURACY}`,
+          `candidates=${candidates}`,
+          "rows=30",
+          anilistID ? `fq=id:${anilistID}/*` : "",
+        ].join("&")}`,
+        {
+          method: "POST",
+          body: image,
+        }
+      )
+    )
+  );
+
+const logAndDequeue = async (
+  locals,
+  ip,
+  userId = null,
+  concurrentId,
+  priority,
+  code,
+  searchTime = null,
+  accuracy = null
+) => {
+  if (code === 200) {
+    while (locals.mut) await new Promise((resolve) => setTimeout(resolve, 0));
+    locals.mut = true;
+    if (userId) {
+      await sql`
+        UPDATE users
+        SET quota_used = quota_used + 1
+        WHERE id = ${userId}
+      `;
+    } else {
+      await sql`
+        INSERT INTO quota (ip, used)
+        VALUES (${ip}, 1)
+        ON DUPLICATE KEY UPDATE used = used + 1
+      `;
+    }
+    locals.mut = false;
+  }
+
+  await sql`
+    INSERT INTO logs (created, ip, user_id, code, search_time, accuracy)
+    VALUES (
+      NOW(),
+      ${ip},
+      ${userId},
+      ${code},
+      ${searchTime < 0 ? null : searchTime},
+      ${accuracy < 0 ? null : accuracy}
+    )
+  `;
+
+  const concurrentCount = locals.searchConcurrent.get(concurrentId) ?? 0;
+  if (concurrentCount <= 1) {
+    locals.searchConcurrent.delete(concurrentId);
+  } else {
+    locals.searchConcurrent.set(concurrentId, concurrentCount - 1);
+  }
+
+  locals.searchQueue[priority] = (locals.searchQueue[priority] || 1) - 1;
+};
+
+const extractImageByFFmpeg = async (searchFile) => {
+  const tempFilePath = path.join(
+    os.tmpdir(),
+    `trace.moe-search-${process.hrtime().join("")}`
+  );
+  await fs.writeFile(tempFilePath, searchFile);
+  const ffmpeg = child_process.spawnSync("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-nostats",
+    "-y",
+    "-i",
+    tempFilePath,
+    "-ss",
+    "00:00:00",
+    "-map_metadata",
+    "-1",
+    "-vf",
+    "scale=320:-2",
+    "-c:v",
+    "mjpeg",
+    "-vframes",
+    "1",
+    "-f",
+    "image2pipe",
+    "pipe:1",
+  ]);
+  await fs.rm(tempFilePath, { force: true });
+  return ffmpeg.stdout;
+};
+
+const cutBorders = async (imageBuffer) => {
+  const { info } = await sharp(
+    await sharp(imageBuffer).normalize().dilate(2).toBuffer()
+  )
+    .trim({ background: "black", threshold: 30 })
+    .toBuffer({ resolveWithObject: true });
+
+  const trimmedTop = Math.abs(info.trimOffsetTop);
+  const trimmedLeft = Math.abs(info.trimOffsetLeft);
+  const newWidth = info.width;
+  const newHeight = info.height;
+
+  if (
+    Math.abs(newWidth / newHeight - 16 / 9) < 0.05 ||
+    Math.abs(newWidth / newHeight - 4 / 3) < 0.05
+  ) {
+    return await sharp(imageBuffer)
+      .extract({
+        left: trimmedLeft,
+        top: trimmedTop,
+        width: newWidth,
+        height: newHeight,
+      })
+      .jpeg()
+      .toBuffer();
+  } else if (Math.abs(newWidth / newHeight - 21 / 9) < 0.1) {
+    const { width, height } = await sharp(imageBuffer).metadata();
+    if ((width - newWidth) / width > 0.05 || (height - newHeight) / height > 0.05) {
+      return await sharp(imageBuffer)
+        .extract({
+          left: trimmedLeft,
+          top: trimmedTop,
+          width: newWidth,
+          height: newHeight,
+        })
+        .resize({ width: 320, height: 180, fit: "contain" })
+        .jpeg()
+        .toBuffer();
+    }
+  }
+
+  return imageBuffer;
+};
+
+export default async (req, res) => {
+  const locals = req.app.locals;
+
+  // default tier lookup + guard
+  let [defaultTier] = await sql`
+    SELECT concurrency, quota, priority
+    FROM tiers
+    WHERE id = 0
+  `;
+  if (!defaultTier) {
+    throw new Error("Default tier (id=0) not found in database");
+  }
+  let quota = defaultTier.quota;
+  let quotaUsed = 0;
+  let concurrency = defaultTier.concurrency;
+  let priority = defaultTier.priority;
+  let userId = null;
+
+  const apiKey = req.query.key ?? req.header("x-trace-key") ?? "";
+  if (apiKey) {
+    let [user] = await sql`
+      SELECT id, quota, quota_used, concurrency, priority
+      FROM users_view
+      WHERE api_key = ${apiKey}
+    `;
+    if (!user) {
+      return res.status(403).json({ error: "Invalid API key" });
+    }
+    quota = user.quota;
+    quotaUsed = user.quota_used;
+    concurrency = user.concurrency;
+    priority = user.priority;
+    userId = user.id;
+  } else {
+    let [row] = await sql`
+      SELECT network, SUM(used) AS used
+      FROM quota
+      WHERE network = ${req.ip}
+      GROUP BY network
+    `;
+    quotaUsed = row?.used ?? 0;
+  }
+
+  // simple concurrency key
+  let concurrentId = userId ?? req.ip;
+
+  if (quotaUsed >= quota) {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 402);
+    return res.status(402).json({ error: "Search quota depleted" });
+  }
+
+  locals.searchConcurrent.set(
+    concurrentId,
+    (locals.searchConcurrent.get(concurrentId) ?? 0) + 1
+  );
+  if (locals.searchConcurrent.get(concurrentId) > concurrency) {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 402);
+    return res.status(402).json({ error: "Concurrency limit exceeded" });
+  }
+
+  locals.searchQueue[priority] = (locals.searchQueue[priority] ?? 0) + 1;
+  let queueSize = locals.searchQueue.reduce(
+    (acc, cur, idx) => (idx >= priority ? acc + cur : acc),
+    0
+  );
+
+  if (queueSize > SEARCH_QUEUE) {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 503);
+    return res.status(503).json({ error: "Search queue is full" });
+  }
+
+  // read file data
+  let searchFile = Buffer.alloc(0);
+  if (req.query.url) {
+    try {
+      new URL(req.query.url);
+    } catch {
+      await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 400);
+      return res.status(400).json({ error: `Invalid image url ${req.query.url}` });
+    }
+    const response = await fetch(
+      USE_IMAGE_PROXY &&
+        ![
+          "api.telegram.org",
+          "telegra.ph",
+          "t.me",
+          "discord.com",
+          "cdn.discordapp.com",
+          "media.discordapp.net",
+          "images-ext-1.discordapp.net",
+          "images-ext-2.discordapp.net",
+        ].includes(new URL(req.query.url).hostname)
+        ? `https://trace.moe/image-proxy?url=${encodeURIComponent(req.query.url)}`
+        : req.query.url
+    ).catch(() => ({ status: 400 }));
+    if (response.status >= 400) {
+      await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 400);
+      return res.status(response.status).json({ error: `Failed to fetch image ${req.query.url}` });
+    }
+    searchFile = Buffer.from(await response.arrayBuffer());
+  } else if (req.files?.length) {
+    searchFile = req.files[0].buffer;
+  } else if (req.rawBody?.length) {
+    searchFile = req.rawBody;
+  } else {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 405);
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+
+  // prepare image for search
+  const searchImagePNG = await sharp(searchFile)
+    .resize({ width: 320, height: 320, fit: "inside" })
+    .toBuffer()
+    .catch(() => extractImageByFFmpeg(searchFile));
+
+  if (!searchImagePNG.length) {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 400);
+    return res.status(400).json({ error: "Failed to process image" });
+  }
+
+  const searchImage =
+    "cutBorders" in req.query
+      ? await cutBorders(searchImagePNG)
+      : await sharp(searchImagePNG).jpeg().toBuffer();
+
+  // perform Solr search
+  let candidates = 1000000;
+  const startTime = performance.now();
+  let solrResponse;
+  try {
+    solrResponse = await search(searchImage, candidates, Number(req.query.anilistID));
+  } catch {
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 503);
+    return res.status(503).json({ error: "Error: Database is not responding" });
+  }
+  if (solrResponse.find((e) => e.status >= 500)) {
+    const r = solrResponse.find((e) => e.status >= 500);
+    await logAndDequeue(locals, req.ip, userId, concurrentId, priority, r.status);
+    return res.status(r.status).json({ error: `Database is ${r.status === 504 ? "overloaded" : "offline"}` });
+  }
+
+  let solrResults = await Promise.all(solrResponse.map((e) => e.json()));
+  const maxRawDocsCount = Math.max(...solrResults.map((e) => Number(e.RawDocsCount)));
+
+  if (maxRawDocsCount > candidates) {
+    candidates = maxRawDocsCount;
+    solrResponse = await search(searchImage, candidates, Number(req.query.anilistID));
+    if (solrResponse.find((e) => e.status >= 500)) {
+      const r = solrResponse.find((e) => e.status >= 500);
+      await logAndDequeue(locals, req.ip, userId, concurrentId, priority, r.status);
+      return res.status(r.status).json({ error: `Database is ${r.status === 504 ? "overloaded" : "offline"}` });
+    }
+    solrResults = await Promise.all(solrResponse.map((e) => e.json()));
+  }
+  const searchTime = Math.round(performance.now() - startTime);
+
+  // collate and merge results
+  let result = [];
+  let frameCountList = [];
+
+  for (const { RawDocsCount, response } of solrResults) {
+    frameCountList.push(Number(RawDocsCount));
+    result = result.concat(response.docs);
+  }
+
+  result = result
+    .reduce((list, { d, id }) => {
+      const anilist_id = Number(id.split("/")[0]);
+      const filename = id.split("/")[1];
+      const t = Number(id.split("/")[2]);
+      const idx = list.findIndex(
+        (e) =>
+          e.anilist_id === anilist_id &&
+          e.filename === filename &&
+          (Math.abs(e.from - t) < 5 || Math.abs(e.to - t) < 5)
+      );
+      if (idx < 0) {
+        list.push({ anilist_id, filename, from: t, to: t, d });
+      } else {
+        list[idx].from = Math.min(list[idx].from, t);
+        list[idx].to = Math.max(list[idx].to, t);
+        list[idx].d = Math.min(list[idx].d, d);
+      }
+      return list;
+    }, [])
+    .sort((a, b) => a.d - b.d)
+    .slice(0, 10);
+
+  // generate tokens & URLs
+  const window = 3600;
+  const now = Math.floor(Date.now() / 1000 / window) * window + window;
+  result = result.map(({ anilist_id, filename, from, to, d }) => {
+    const mid = from + (to - from) / 2;
+    const base = [anilist_id, filename, mid, now, TRACE_API_SALT].join("");
+    const videoToken = crypto.createHash("sha1").update(base).digest("base64").replace(/[^0-9A-Za-z]/g, "");
+    const imageToken = crypto.createHash("sha1").update(base).digest("base64").replace(/[^0-9A-Za-z]/g, "");
+
+    return {
+      anilist: anilist_id,
+      filename,
+      episode: aniep(filename),
+      from,
+      to,
+      similarity: (100 - d) / 100,
+      video: `${req.protocol}://${req.get("host")}/video/${anilist_id}/${encodeURIComponent(
+        filename
+      )}?t=${mid}&now=${now}&token=${videoToken}`,
+      image: `${req.protocol}://${req.get("host")}/image/${anilist_id}/${encodeURIComponent(
+        filename
+      )}?t=${mid}&now=${now}&token=${imageToken}`,
+    };
+  });
+   
+  // optionally fetch AniList details via literal IN(...)
+  if ("anilistInfo" in req.query && result.length) {
+    // build an array of IDs
+    const ids = result.map((r) => r.anilist);
+    // mysql2 will expand the array for IN (?)
+    const rows = await sql`
+      SELECT id, json
+      FROM anilist
+      WHERE id IN (${ids})
+    `;
+    // merge JSON back into each entry
+    result = result.map((entry) => {
+      const info = rows.find((r) => r.id === entry.anilist);
+      if (info) entry.anilist = info.json;
+      return entry;
+    });
+  }
+  
+  await logAndDequeue(locals, req.ip, userId, concurrentId, priority, 200, searchTime, result[0]?.similarity ?? 0);
+
+  res.json({
+    frameCount: frameCountList.reduce((sum, x) => sum + x, 0),
+    error: "",
+    result,
+  });
+};

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs><style>.ring{fill:none;stroke:#14b8a6;stroke-width:120;}</style></defs>
+  <circle class="ring" cx="512.0" cy="512.0" r="392.0"/>
+  <rect x="177.0" y="372.0" width="90" height="280" rx="40" ry="40" fill="#fff"/>
+  <rect x="322.0" y="282.0" width="90" height="460" rx="40" ry="40" fill="#fff"/>
+  <rect x="467.0" y="192.0" width="90" height="640" rx="40" ry="40" fill="#fff"/>
+  <rect x="612.0" y="282.0" width="90" height="460" rx="40" ry="40" fill="#fff"/>
+  <rect x="757.0" y="372.0" width="90" height="280" rx="40" ry="40" fill="#fff"/>
+</svg>

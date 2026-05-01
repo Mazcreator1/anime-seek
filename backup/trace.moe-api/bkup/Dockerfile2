@@ -1,0 +1,92 @@
+# Dockerfile.api
+
+FROM ghcr.io/soruly/trace.moe-api:latest
+
+
+
+USER root
+
+
+
+# Install ffmpeg + build tools for mysql2
+
+RUN if command -v apk >/dev/null; then \
+
+      apk add --no-cache ffmpeg python3 make g++; \
+
+    else \
+
+      apt-get update && \
+
+      apt-get install -y ffmpeg python3 build-essential && \
+
+      rm -rf /var/lib/apt/lists/*; \
+
+    fi
+
+
+
+WORKDIR /app
+
+
+
+# 1) Overwrite the core handler with your patched MySQL version
+
+COPY patched-src/search.js src/search.js
+
+
+
+# 2) Remove Postgres.js, install mysql2, and write our mysql2 helper as sql.js
+
+RUN npm uninstall postgres \
+
+ && npm install mysql2 \
+
+ && cat << 'EOF' > sql.jsa
+
+// sql.js
+
+import mysql from 'mysql2/promise';
+
+const pool = mysql.createPool({
+
+  host:     process.env.SOLA_DB_HOST,
+
+  port:     +process.env.SOLA_DB_PORT || 3306,
+
+  user:     process.env.SOLA_DB_USER,
+
+  password: process.env.SOLA_DB_PWD,
+
+  database: process.env.SOLA_DB_NAME,
+
+  waitForConnections: true,
+
+  connectionLimit: 10
+
+});
+
+export default async function sql(strings, ...values) {
+
+  let text = strings[0];
+
+  for (let i = 0; i < values.length; i++) {
+
+    text += '?';
+
+    text += strings[i + 1];
+
+  }
+
+  const [rows] = await pool.query(text, values);
+
+  return rows;
+
+}
+
+EOF
+
+
+
+# 3) Upstream ENTRYPOINT/CMD remain (PM2 → npm start)
+

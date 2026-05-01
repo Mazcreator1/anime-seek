@@ -1,0 +1,38 @@
+etcd:
+  requestTimeout: 30000
+
+queryNode:
+  enableDisk: true                    # required for on-disk index usage :contentReference[oaicite:5]{index=5}
+
+  loadMemoryUsageFactor: 1.5          # if still tight, try 1.2 :contentReference[oaicite:6]{index=6}
+
+  cache:
+    enabled: true
+    memoryLimit: 8589934592           # 8 GB :contentReference[oaicite:7]{index=7}
+
+  mmap:
+    vectorField: true                 # optional; measure impact
+    vectorIndex: false                # DISKANN not supported by mmap.vectorIndex :contentReference[oaicite:8]{index=8}
+    scalarField: false
+    scalarIndex: false
+
+quotaAndLimits:
+  limitWriting:
+    memProtection:
+      enabled: true
+      dataNodeMemoryLowWaterLevel: 0.75
+      dataNodeMemoryHighWaterLevel: 0.85
+      queryNodeMemoryLowWaterLevel: 0.75
+      queryNodeMemoryHighWaterLevel: 0.85
+
+common:
+  DiskIndex:
+    MaxDegree: 56
+    SearchListSize: 100
+    PQCodeBudgetGBRatio: 0.0625        # key RAM lever :contentReference[oaicite:9]{index=9}
+    SearchCacheBudgetGBRatio: 0.05     # key RAM lever :contentReference[oaicite:10]{index=10}
+    BeamWidthRatio: 2.0
+
+indexNode:
+  scheduler:
+    buildParallel: 4

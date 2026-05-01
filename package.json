@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@zilliz/milvus2-sdk-node": "^2.5.10",
+    "jsonwebtoken": "^9.0.2"
+  }
+}

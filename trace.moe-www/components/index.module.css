@@ -1,0 +1,197 @@
+.dropTarget {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  margin-bottom: 160px;
+  background: var(--drop-bg-color);
+  text-align: center;
+  font-size: 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: transparent;
+  transition: all 50ms ease-out;
+  backdrop-filter: blur(0);
+  z-index: 1;
+}
+@media (max-width: 500px) {
+  .dropTarget {
+    margin-bottom: 320px;
+  }
+}
+
+.dropping {
+  background: var(--drop-main-color);
+  border: 0.5rem dashed var(--theme-main-color);
+  color: var(--theme-main-color);
+  transition: all 50ms ease-out;
+  backdrop-filter: blur(3px);
+  z-index: 100;
+}
+
+.main {
+  display: flex;
+  justify-content: center;
+}
+.mainReady {
+  display: block;
+}
+
+.wrap {
+  opacity: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: center;
+
+  margin: 3rem auto;
+  padding: 1rem 0;
+  gap: 1rem;
+  overflow: hidden;
+  position: relative;
+  min-height: 100vh;
+  z-index: 10;
+}
+@media (max-width: 500px) {
+  .wrap {
+    padding: 1rem 1rem;
+    margin: 5rem 0;
+  }
+}
+.searchImageDisplay {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  align-content: space-around;
+  justify-content: space-between;
+  background: linear-gradient(
+        0deg,
+        var(--result-draw-color) 0,
+        var(--result-draw-color) 90%,
+        var(--result-line-color) 90%,
+        var(--result-line-color) 100%
+      )
+      0 50%,
+    linear-gradient(
+        90deg,
+        var(--result-draw-color) 0,
+        var(--result-draw-color) 90%,
+        var(--result-line-color) 90%,
+        var(--result-line-color) 100%
+      )
+      50% 0,
+    var(--result-main-color);
+  background-size: 20px 20px;
+  box-shadow: 0 0 20px var(--shadow-color);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+.messageTextLabel {
+  color: var(--text-strong-color);
+  font-size: 0.7rem;
+  line-height: 1rem;
+  height: 1rem;
+  width: 100%;
+  padding: 0.2rem 0.5rem 0.2rem 0.5rem;
+  border-top: 1px dashed var(--theme-weak-color);
+}
+.detail {
+  color: var(--text-strong-color);
+  font-size: 0.8rem;
+  text-align: center;
+  flex-grow: 1;
+}
+.originalImageDisplay {
+  width: 160px;
+  min-height: 90px;
+  max-height: 100px;
+  display: block;
+}
+.resultList {
+  width: 320px;
+  margin-bottom: 2rem;
+}
+.resultList button {
+  color: var(--text-main-color);
+  background-color: var(--blank-color);
+  outline: 0;
+  border: 1px solid var(--shadow-color);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 0.7rem;
+  padding: 0.5rem;
+  box-shadow: 1px 1px 3px var(--shadow-color);
+  transition: all 100ms ease-out;
+}
+.resultList button:hover {
+  box-shadow: 1px 1px 5px var(--theme-main-color);
+  transition: all 100ms ease-out;
+}
+.resultList button:active {
+  box-shadow: 0 0 2px var(--theme-main-color);
+  transform: translate(1px, 1px);
+  transition: all 100ms ease-out;
+}
+
+.playerInfoPane {
+  box-shadow: 0 0 20px var(--shadow-color);
+  background: var(--blank-color);
+  background-size: 50px 50px;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  transition: all 200ms ease-out;
+}
+.closeBtn {
+  display: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 0.5rem;
+  font-size: 1.5rem;
+  cursor: pointer;
+  transition: all 100ms ease-out;
+}
+.closeBtn:hover {
+  text-shadow: 0 0 0.125rem var(--text-strong-color);
+}
+
+@media (max-width: 1008px) {
+  .closeBtn {
+    display: block;
+  }
+  .resultList {
+    width: 100%;
+    max-width: 640px;
+  }
+  .playerInfoPane {
+    width: 100%;
+    max-width: 640px;
+    position: absolute;
+    transform: translate(0, 0);
+  }
+  .playerInfoPane.hidden {
+    transform: translate(100vw, 0);
+  }
+}
+
+@media (max-width: 640px) {
+  .wrap {
+    min-height: 150vh;
+  }
+  .closeBtn {
+    display: block;
+  }
+  .resultList {
+    width: 100%;
+  }
+  .playerInfoPane {
+    width: 100%;
+    position: absolute;
+    transform: translate(0, 0);
+  }
+  .playerInfoPane.hidden {
+    transform: translate(100vw, 0);
+  }
+}

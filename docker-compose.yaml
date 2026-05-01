@@ -1,0 +1,338 @@
+services:
+  # --- Infra for Milvus ---
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: etcd
+    restart: unless-stopped
+
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    command: >
+      etcd
+        --name etcd
+        --data-dir /etcd-data
+        --advertise-client-urls http://etcd:2379
+        --listen-client-urls http://0.0.0.0:2379
+    volumes:
+      - etcd:/etcd-data
+    ports:
+      - "2379:2379"
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks: [anime_finder_net]
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: minio
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - /mnt/e/anime-seeker/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks: [anime_finder_net]
+
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.6.7
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: rocksmq
+    volumes:
+      - milvus:/var/lib/milvus
+      - ./user.yaml:/milvus/configs/user.yaml:ro
+    depends_on:
+      - etcd
+      - minio
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    networks: [anime_finder_net]
+
+  # --- Databases / Cache ---
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command: ["-c", "shared_preload_libraries="]
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [anime_finder_net]
+
+  logs-backfill:
+    image: postgres:17
+    depends_on: [postgres]
+    networks: [anime_finder_net]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    entrypoint: ["/bin/sh","-lc"]
+    command: |
+      while true; do
+        psql -v ON_ERROR_STOP=1 -c "
+          UPDATE logs l
+          SET api_key = u.api_key
+          FROM users u
+          WHERE u.id = l.user_id
+            AND (l.api_key IS NULL OR l.api_key = '');
+        " || echo 'backfill failed'
+        sleep 240
+      done
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: devrecapz@gmail.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks: [anime_finder_net]
+
+  mysql:
+    image: mariadb:10.5
+    container_name: mysql
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD}
+      - MYSQL_PORT=${MYSQL_PORT}
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+      - ./mysql.cnf:/etc/mysql/conf.d/mysql.cnf:ro
+      - ./trace.moe-api/src:/app/src
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h127.0.0.1 -u${MYSQL_USER} -p${MYSQL_PASSWORD} || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "3306:3306"
+    networks: [anime_finder_net]
+
+  adminer:
+    image: adminer:4.8.1
+    restart: unless-stopped
+    environment:
+      - ADMINER_DEFAULT_SERVER=mysql
+    ports:
+      - "8081:8080"
+    depends_on:
+      - mysql
+    networks: [anime_finder_net]
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks: [anime_finder_net]
+
+  # --- Apps ---
+
+  api:
+    image: anime-seek:api
+    build:
+      context: ./trace.moe-api
+      dockerfile: Dockerfile.api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASS: postgres
+      DB_NAME: postgres
+      MILVUS_ADDR: milvus:19530
+      MILVUS_TOKEN: root:Milvus
+      TRACE_API_SALT: SALT
+      SERVER_PORT: "3000"
+      MAX_WORKER: "4"
+      VIDEO_PATH: /app/video/
+      HASH_PATH: /app/hash/
+      ACCESS_CONTROL_ALLOW_ORIGIN: "https://anime-seek.com"
+      ACCESS_CONTROL_ALLOW_HEADERS: "Content-Type, x-trace-key, x-debug"
+      ACCESS_CONTROL_ALLOW_METHODS: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS"
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    ports:
+      - "3311:3000"
+    volumes:
+      - ./data/hash:/app/hash
+      - type: bind
+        source: /mnt/f/anilist
+        target: /app/video
+        read_only: true
+    networks: [anime_finder_net]
+
+  www:
+    image: anime-seek:Custom
+    restart: unless-stopped
+    build:
+      context: ./trace.moe-www
+      dockerfile: Dockerfile.www
+    env_file:
+      - ./.env
+    environment:
+      - NEXT_PUBLIC_API_ENDPOINT=${NEXT_PUBLIC_API_ENDPOINT}
+    ports:
+      - "${WWW_PORT}:3000"
+    networks: [anime_finder_net]
+
+  attu:
+    image: zilliz/attu:latest
+    ports:
+      - "8000:3000"
+    environment:
+      MILVUS_URL: "milvus:19530"
+      MILVUS_TOKEN: "root:Milvus"
+    depends_on:
+      milvus:
+        condition: service_healthy
+    networks: [anime_finder_net]
+
+  fastapi:
+    container_name: anime_finder_fastapi
+    restart: unless-stopped
+    build:
+      context: ./anime_audio_backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    volumes:
+      - ./anime_audio_backend:/app
+      - ./anime_audio_backend/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8047:8047"
+    environment:
+      SQLALCHEMY_DATABASE_URL: "postgresql+psycopg://postgres:postgres@postgres:5432/postgres"
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: postgres
+      PG_PASS: postgres
+      PG_NAME: postgres
+
+      DEJAVU_DB_TYPE: mysql
+      DEJAVU_DB_HOST: mysql
+      DEJAVU_DB_PORT: "3306"
+      DEJAVU_DB_USER: animeseeker
+      DEJAVU_DB_PASSWORD: "Lopez1@3!"
+      DB_PASSWORD: "Lopez1@3!"
+      DEJAVU_DB_NAME: dejavu
+
+      APP_MODULE: main:app
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+
+      SECRET_KEY: "${SECRET_KEY}"
+      STRIPE_API_KEY: "${STRIPE_API_KEY}"
+      STRIPE_WEBHOOK_SECRET: "${STRIPE_WEBHOOK_SECRET}"
+      STRIPE_PRICE_ID: "${STRIPE_PRICE_ID}"
+      ANILIST_API: "${ANILIST_API}"
+    networks: [anime_finder_net]
+
+  static-ui:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./static-ui:/usr/share/nginx/html:ro
+    networks: [anime_finder_net]
+
+
+  nginx-proxy:
+    image: nginx:1.25-alpine
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+      - fastapi
+      - www
+    networks: [anime_finder_net]
+
+
+networks:
+  anime_finder_net:
+    driver: bridge
+
+volumes:
+  milvus:
+    name: anime-seeker_milvus
+  etcd:
+    name: anime-seeker_etcd
+  minio:
+    name: anime-seeker_minio

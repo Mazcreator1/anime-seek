@@ -1,0 +1,22 @@
+[0;1;32m●[0m docker.service - Docker Application Container Engine
+     Loaded: loaded (/lib/systemd/system/docker.service; enabled; vendor preset: enabled)
+     Active: [0;1;32mactive (running)[0m since Thu 2025-06-05 03:53:48 UTC; 31min ago
+TriggeredBy: [0;1;32m●[0m docker.socket
+       Docs: https://docs.docker.com
+   Main PID: 632 (dockerd)
+      Tasks: 13
+     Memory: 34.9M
+        CPU: 1.024s
+     CGroup: /system.slice/docker.service
+             └─632 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.564008011Z" level=warning msg="Error (Unable to complete atomic operation, key modified) deleting object [endpoint_count 16162c2d651e72ace16febc81465e912c9ac9f48a4d2c1b0271bff04e59b2812], retrying...."
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.715442724Z" level=info msg="Loading containers: done."
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.824198807Z" level=info msg="Docker daemon" commit=45873be containerd-snapshotter=false storage-driver=overlay2 version=28.2.2
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.824945436Z" level=info msg="Initializing buildkit"
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.881876507Z" level=warning msg="CDI setup error /etc/cdi: failed to monitor for changes: no such file or directory"
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.881909757Z" level=warning msg="CDI setup error /var/run/cdi: failed to monitor for changes: no such file or directory"
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.946524572Z" level=info msg="Completed buildkit initialization"
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.977405757Z" level=info msg="Daemon has completed initialization"
+Jun 05 03:53:48 ip-172-26-4-15 dockerd[632]: time="2025-06-05T03:53:48.977472409Z" level=info msg="API listen on /run/docker.sock"
+Jun 05 03:53:48 ip-172-26-4-15 systemd[1]: Started Docker Application Container Engine.

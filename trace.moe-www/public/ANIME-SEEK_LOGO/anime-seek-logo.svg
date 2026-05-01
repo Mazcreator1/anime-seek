@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <style>
+      .ring { fill: none; stroke: #14b8a6; stroke-width: 120; }
+      .play { fill: #ffffff; }
+      .slash { stroke: #ffffff; stroke-width: 60; stroke-linecap: round; }
+    </style>
+  </defs>
+  <circle class="ring" cx="512.0" cy="512.0" r="392.0"/>
+  <polygon class="play" points="352,302 352,722 712,512"/>
+  <line class="slash" x1="700" y1="240" x2="240" y2="700"/>
+</svg>

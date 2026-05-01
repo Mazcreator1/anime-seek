@@ -1,0 +1,43 @@
+# /etc/nginx/sites-available/anime-seek
+
+# 1) Redirect HTTP → HTTPS
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name anime-seek.com www.anime-seek.com;
+    return 301 https://$host$request_uri;
+}
+
+# 2) Terminate HTTPS and proxy *everything* to Next.js (3310)
+server {
+    listen              443 ssl http2 default_server;
+    listen              [::]:443 ssl http2 default_server;
+    server_name         anime-seek.com www.anime-seek.com;
+
+    # allow big uploads
+    client_max_body_size 50M;
+
+    # Let's Encrypt
+    ssl_certificate     /etc/letsencrypt/live/anime-seek.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/anime-seek.com/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Pass every request (pages, /api/search, static assets) to Next.js
+    location / {
+        proxy_pass              http://127.0.0.1:3310;
+        proxy_http_version      1.1;
+
+        # preserve WebSocket / streaming uploads
+        proxy_set_header        Upgrade            $http_upgrade;
+        proxy_set_header        Connection         "upgrade";
+        proxy_request_buffering off;
+        proxy_buffering         off;
+
+        # preserve client info
+        proxy_set_header        Host               $host;
+        proxy_set_header        X-Real-IP          $remote_addr;
+        proxy_set_header        X-Forwarded-For    $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto  $scheme;
+    }
+}

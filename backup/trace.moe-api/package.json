@@ -1,0 +1,52 @@
+{
+  "name": "trace.moe-api",
+  "version": "1.0.0",
+  "description": "API server of trace.moe",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "pm2 start ecosystem.config.json",
+    "watch": "pm2 start ecosystem.config.json --watch",
+    "stop": "pm2 stop ecosystem.config.json",
+    "restart": "pm2 restart ecosystem.config.json",
+    "reload": "pm2 reload ecosystem.config.json",
+    "delete": "pm2 delete ecosystem.config.json",
+    "prettier": "prettier",
+    "format": "prettier --write \"**/*.js\"",
+    "lint": "prettier --check \"**/*.js\"",
+    "test": "prettier --check \"**/*.js\"",
+    "jest": "NODE_NO_WARNINGS=1 NODE_OPTIONS=--experimental-vm-modules jest --runInBand"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/soruly/trace.moe-api.git"
+  },
+  "author": "soruly",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/soruly/trace.moe-api/issues"
+  },
+  "homepage": "https://github.com/soruly/trace.moe-api#readme",
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "prettier": "^3.5.3",
+    "supertest": "^7.1.1"
+  },
+  "dependencies": {
+    "@soruly/opencv4nodejs-prebuilt": "^7.1.0",
+    "aniep": "^0.6.0",
+    "better-sqlite3": "^11.10.0",
+    "canvas": "^3.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "knex": "^3.1.0",
+    "lzma-native": "^8.0.6",
+    "multer": "^1.4.5-lts.2",
+    "mysql2": "^3.11.0",
+    "nodemailer": "^7.0.3",
+    "rss": "^1.2.2",
+    "xmldoc": "^2.0.1"
+  }
+}

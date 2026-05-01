@@ -1,0 +1,63 @@
+# Dockerfile.api — build from local source (no soruly base)
+FROM node:22-bullseye-slim
+
+ENV NODE_ENV=production
+
+# ffmpeg + native build deps + common OpenCV/ffmpeg libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg python3 build-essential ca-certificates \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install deps first (faster rebuilds)
+COPY package*.json ./
+RUN npm ci --omit=dev \
+ && npm install --omit=dev mysql2
+
+# Copy your whole project
+COPY . .
+
+# Ensure helper exists for: import ... from "./lib/get-solr-core-list.js"
+RUN mkdir -p ./src/lib && \
+    [ -f ./src/lib/get-solr-core-list.js ] || { \
+      echo "export default function getSolrCoreList() {" > ./src/lib/get-solr-core-list.js; \
+      echo "  const raw=(process.env.SOLA_SOLR_LIST||'').trim();" >> ./src/lib/get-solr-core-list.js; \
+      echo "  const core=(process.env.LIRE_CORE||'').trim();" >> ./src/lib/get-solr-core-list.js; \
+      echo "  let bases=raw.split(',').map(s=>s.trim()).filter(Boolean).map(s=>s.replace(/\\/+\$/,''));" >> ./src/lib/get-solr-core-list.js; \
+      echo "  if(bases.length===0) bases=['http://liresolr:8983/solr'];" >> ./src/lib/get-solr-core-list.js; \
+      echo "  return bases.map(b => (/\\/solr\\/[^/]+$/.test(b)||!core)?b:\`\${b}/\${core}\`);" >> ./src/lib/get-solr-core-list.js; \
+      echo "}" >> ./src/lib/get-solr-core-list.js; \
+    }
+
+# Provide MySQL-based sql.js with .file() for server.js
+# (server.js calls: await sql.file('./sql/1.init.sql'))
+RUN node -e "require('fs').writeFileSync('sql.js', `\
+import mysql from 'mysql2/promise';\
+import fs from 'fs/promises';\
+const pool = mysql.createPool({\
+  host: process.env.SOLA_DB_HOST,\
+  port: +(process.env.SOLA_DB_PORT||3306),\
+  user: process.env.SOLA_DB_USER,\
+  password: process.env.SOLA_DB_PWD,\
+  database: process.env.SOLA_DB_NAME,\
+  waitForConnections: true, connectionLimit: 10\
+});\
+export default async function sql(strings, ...values){\
+  let text = strings[0];\
+  for(let i=0;i<values.length;i++){ text += '?'; text += strings[i+1]; }\
+  const [rows] = await pool.query(text, values);\
+  return rows;\
+}\
+sql.file = async function(path){\
+  const content = await fs.readFile(path, 'utf8');\
+  return pool.query(content);\
+};\
+`);"
+
+# If you want to skip init scripts via env, honor them at runtime
+# (no CMD change needed; server.js usually respects SKIP_DB_INIT / DB_AUTO_CREATE)
+
+EXPOSE 3000
+CMD ["node", "server.js"]

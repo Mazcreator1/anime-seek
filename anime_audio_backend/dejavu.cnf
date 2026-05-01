@@ -1,0 +1,1 @@
+{  "database": {    "host":       "mysql",    "user":       "animeseeker",    "passwd":     "Lopez1@3!",    "db":         "dejavu",    "autocommit": true  }}

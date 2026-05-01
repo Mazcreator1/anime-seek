@@ -1,0 +1,204 @@
+############################################################
+
+# Stage 1: build environment – compile wheels, install deps
+
+############################################################
+
+FROM python:3.10-slim AS builder
+
+
+
+# 1) Install build tools & headers for mysqlclient, PyAudio, OpenCV, etc.
+
+USER root
+
+RUN apt-get update && \
+
+    apt-get install -y --no-install-recommends \
+
+      build-essential \
+
+      default-libmysqlclient-dev \
+
+      python3-dev \
+
+      portaudio19-dev \
+
+      libffi-dev \
+
+      libgl1-mesa-glx \
+
+      libglib2.0-0 \
+
+      libsm6 \
+
+      libxrender1 \
+
+      libxext6 \
+
+      python3-lib2to3 \
+
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+WORKDIR /app
+
+
+
+# 2) Copy and install Python dependencies
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --upgrade pip \
+
+    && pip install --no-cache-dir -r requirements.txt
+
+
+
+# 3) If using the old 'dejavu' package, run 2to3 to fix Python2 print statements
+
+RUN if [ -d "/usr/local/lib/python3.10/site-packages/dejavu" ]; then \
+
+      2to3 -w /usr/local/lib/python3.10/site-packages/dejavu; \
+
+    fi
+
+
+
+# 4) Copy your FastAPI application code
+
+COPY . /app
+
+
+
+
+
+############################################################
+
+# Stage 2: runtime environment – minimal image
+
+############################################################
+
+FROM tiangolo/uvicorn-gunicorn-fastapi:python3.10 AS runtime
+
+
+
+# 5) Make sure we're root before installing runtime libraries
+
+USER root
+
+
+
+# 6) Install only the runtime libraries:
+
+#      - libmariadb3      (for mysqlclient/PyMySQL)
+
+#      - OpenCV libs      (libgl1-mesa-glx, etc.)
+
+#      - libportaudio2    (for PyAudio)
+
+RUN apt-get update && \
+
+    apt-get install -y --no-install-recommends \
+
+      libmariadb3 \
+
+      libgl1-mesa-glx \
+
+      libglib2.0-0 \
+
+      libsm6 \
+
+      libxrender1 \
+
+      libxext6 \
+
+      libportaudio2 \
+
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+# 7) Install PyMySQL (and create the MySQLdb shim) as root
+
+RUN pip install --no-cache-dir PyMySQL && \
+
+    printf "import pymysql\npymysql.install_as_MySQLdb()\n" \
+
+           > /usr/local/lib/python3.10/site-packages/MySQLdb.py
+
+
+
+# 8) Tell tiangolo which module to load, and set the internal port to 8047
+
+ENV APP_MODULE=main:app
+
+ENV PORT=8047
+
+
+
+# ── Ensure /app is on Python path so flat imports work
+
+ENV PYTHONPATH=/app
+
+
+
+# ── Ensure Gunicorn chdirs into /app so relative imports resolve
+
+ENV GUNICORN_CMD_ARGS="--chdir /app"
+
+
+
+WORKDIR /app
+
+
+
+# 9) Copy Python packages (including mysqlclient, dejavu, opencv-python, pyaudio, etc.) from builder
+
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+
+
+# 10) Copy your FastAPI application code from builder
+
+COPY --from=builder /app /app
+
+
+
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Now switch to a non-root user for runtime
+
+# ────────────────────────────────────────────────────────────────────────────────
+
+
+
+# 11) Create an unprivileged user named "ubuntu" if it doesn't already exist
+
+RUN id -u ubuntu >/dev/null 2>&1 || useradd --no-log-init --create-home --shell /bin/bash ubuntu
+
+
+
+# 12) Make sure /app (and its contents) are owned by user "ubuntu"
+
+RUN chown -R ubuntu:ubuntu /app
+
+
+
+# 13) Switch to that user for all subsequent steps
+
+USER ubuntu
+
+
+
+# 14) Expose port 8047 inside the container
+
+EXPOSE 8047
+
+
+
+# (Tiangolo’s ENTRYPOINT will run: uvicorn main:app --host 0.0.0.0 --port 8047)
+

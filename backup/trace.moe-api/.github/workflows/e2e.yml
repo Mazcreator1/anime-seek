@@ -1,0 +1,61 @@
+name: e2e Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20, 22.13]
+        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+
+    services:
+      mariadb:
+        image: mariadb
+        env:
+          MARIADB_ROOT_PASSWORD: sola
+        ports:
+          - 3306:3306
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: run liresolr
+        run: |
+          sudo mkdir /tmp/solr
+          sudo chown 8983:8983 /tmp/solr
+          docker run -d -p 8983:8983 -v /tmp/solr:/var/solr soruly/liresolr:latest solr-precreate cl_0 /opt/solr/server/solr/configsets/liresolr
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg --fix-missing
+      - run: npm ci
+      - run: npm run jest
+        env:
+          VIDEO_PATH: /home/runner/
+          HASH_PATH: /home/runner/
+          TRACE_API_SALT: YOUR_TRACE_API_SALT
+          SEARCH_QUEUE: 8
+          SOLA_DB_HOST: 127.0.0.1
+          SOLA_DB_PORT: 3306
+          SOLA_DB_USER: root
+          SOLA_DB_PWD: sola
+          SOLA_DB_NAME: test
+          SOLA_SOLR_LIST: http://127.0.0.1:8983/solr/
+          SOLA_SOLR_SIZE: 1
+          EMAIL_SMTP: smtp.ethereal.email
+          EMAIL_SMTP_PORT: 587
+      - name: Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unittests
